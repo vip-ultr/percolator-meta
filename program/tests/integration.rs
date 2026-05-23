@@ -9,7 +9,9 @@
 //!
 //! Run: cargo test --test integration
 
-use governance_adapter::{authority_address as governance_authority_address, id as governance_program_id};
+use governance_adapter::{
+    authority_address as governance_authority_address, id as governance_program_id,
+};
 use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
@@ -22,22 +24,28 @@ use solana_sdk::{
     sysvar,
     transaction::Transaction,
 };
-use spl_token::state::{Account as TokenAccount, AccountState, Mint};
+use spl_token::{
+    instruction::AuthorityType,
+    state::{Account as TokenAccount, AccountState, Mint},
+};
 use std::path::PathBuf;
 
-// Production SLAB_LEN for SBF target.
-// Must match the BPF binary.
-const SLAB_LEN: usize = 1525688;
-const MAX_ACCOUNTS: usize = 4096;
+// Production market account length for the pinned Percolator v16 program.
+const SLAB_LEN: usize = percolator_prog::constants::MARKET_ACCOUNT_LEN;
 
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b,
-    0x90, 0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38,
-    0x58, 0x81,
+    0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
+    0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
 
 // All-zeros feed_id = Hyperp mode (no external oracle read at init)
 const TEST_FEED_ID: [u8; 32] = [0u8; 32];
+
+fn read_percolator_config(data: &[u8]) -> percolator_prog::state::WrapperConfigV16 {
+    percolator_prog::state::read_market_config_mode_and_capacity(data)
+        .expect("read percolator market config")
+        .0
+}
 
 fn percolator_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -148,51 +156,34 @@ fn make_pyth_data(
 // ============================================================================
 
 fn encode_init_market(
-    admin: &Pubkey,
-    mint: &Pubkey,
-    feed_id: &[u8; 32],
-    trading_fee_bps: u64,
+    _admin: &Pubkey,
+    _mint: &Pubkey,
+    _feed_id: &[u8; 32],
+    _trading_fee_bps: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8];
-    data.extend_from_slice(admin.as_ref());
-    data.extend_from_slice(mint.as_ref());
-    data.extend_from_slice(feed_id);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_mark_price_e6 (Hyperp needs > 0)
-    // Per-market admin limits
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    data.extend_from_slice(&10_000_000_000_000_000u128.to_le_bytes()); // max_insurance_floor
-    data.extend_from_slice(&0u64.to_le_bytes()); // min_oracle_price_cap_e2bps
-    // RiskParams (v12.17 format)
+    data.extend_from_slice(&1u16.to_le_bytes()); // max_portfolio_assets
     data.extend_from_slice(&0u64.to_le_bytes()); // h_min
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&trading_fee_bps.to_le_bytes());
-    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_max (must be > 0, >= h_min)
-    data.extend_from_slice(&1000u64.to_le_bytes()); // max_crank_staleness_slots
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // initial_price
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Extended tail (66 bytes) — enable insurance withdrawal + permissionless resolve + force close
-    data.extend_from_slice(&10_000u16.to_le_bytes()); // insurance_withdraw_max_bps = 100% (full drain per call)
-    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1 slot
-    data.extend_from_slice(&2000u64.to_le_bytes()); // permissionless_resolve_stale_slots (> max_crank)
-    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
-    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
-    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&100u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // max_trading_fee_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // trade_fee_base_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // max_price_move_bps_per_slot
+    data.extend_from_slice(&1u64.to_le_bytes()); // max_accrual_dt_slots
+    data.extend_from_slice(&0u64.to_le_bytes()); // max_abs_funding_e9_per_slot
+    data.extend_from_slice(&1u64.to_le_bytes()); // min_funding_lifetime_slots
+    data.extend_from_slice(&1u64.to_le_bytes()); // max_account_b_settlement_chunks
+    data.extend_from_slice(&1u64.to_le_bytes()); // max_bankrupt_close_chunks
+    data.extend_from_slice(&1u64.to_le_bytes()); // max_bankrupt_close_lifetime_slots
+    data.extend_from_slice(&1u128.to_le_bytes()); // public_b_chunk_atoms
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
     data
 }
 
@@ -205,15 +196,14 @@ fn encode_init_lp(matcher: &Pubkey, ctx: &Pubkey, fee: u64) -> Vec<u8> {
 }
 
 fn encode_init_user(fee: u64) -> Vec<u8> {
-    let mut data = vec![1u8];
-    data.extend_from_slice(&fee.to_le_bytes());
-    data
+    let _ = fee;
+    vec![1u8]
 }
 
 fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
+    let _ = user_idx;
     let mut data = vec![3u8];
-    data.extend_from_slice(&user_idx.to_le_bytes());
-    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&(amount as u128).to_le_bytes());
     data
 }
 
@@ -283,7 +273,9 @@ fn encode_resolve_market() -> Vec<u8> {
 }
 
 fn encode_withdraw_insurance() -> Vec<u8> {
-    vec![20u8]
+    let mut data = vec![41u8];
+    data.extend_from_slice(&1u128.to_le_bytes());
+    data
 }
 
 fn encode_admin_force_close(user_idx: u16) -> Vec<u8> {
@@ -293,22 +285,31 @@ fn encode_admin_force_close(user_idx: u16) -> Vec<u8> {
 }
 
 fn encode_set_insurance_withdraw_policy(
-    authority: &Pubkey,
-    min_withdraw_base: u128,
+    _authority: &Pubkey,
+    _min_withdraw_base: u128,
     max_withdraw_bps: u64,
     cooldown_slots: u64,
 ) -> Vec<u8> {
-    let mut data = vec![22u8];
-    data.extend_from_slice(authority.as_ref());
-    data.extend_from_slice(&min_withdraw_base.to_le_bytes());
-    data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
+    let mut data = vec![33u8];
+    data.extend_from_slice(&(max_withdraw_bps as u16).to_le_bytes());
+    data.push(1u8); // deposits_only = true
     data.extend_from_slice(&cooldown_slots.to_le_bytes());
+    data
+}
+
+fn encode_configure_permissionless_resolve(
+    stale_slots: u64,
+    force_close_delay_slots: u64,
+) -> Vec<u8> {
+    let mut data = vec![38u8];
+    data.extend_from_slice(&stale_slots.to_le_bytes());
+    data.extend_from_slice(&force_close_delay_slots.to_le_bytes());
     data
 }
 
 fn encode_topup_insurance(amount: u64) -> Vec<u8> {
     let mut data = vec![9u8];
-    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&(amount as u128).to_le_bytes());
     data
 }
 
@@ -358,6 +359,23 @@ fn encode_governance_init_market_rewards(n: u64, epoch_slots: u64) -> Vec<u8> {
     data
 }
 
+fn encode_governance_mint_reward(amount: u64) -> Vec<u8> {
+    let mut data = vec![4u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn encode_governance_set_market_rewards(n: u64, epoch_slots: u64) -> Vec<u8> {
+    let mut data = vec![5u8];
+    data.extend_from_slice(&n.to_le_bytes());
+    data.extend_from_slice(&epoch_slots.to_le_bytes());
+    data
+}
+
+fn encode_governance_transfer_mint_authority() -> Vec<u8> {
+    vec![6u8]
+}
+
 // ============================================================================
 // Test environment
 // ============================================================================
@@ -377,13 +395,22 @@ struct TestEnv {
     coin_mint: Pubkey,
     mint_authority_pda: Pubkey,
     account_count: u16,
+    percolator_portfolios: Vec<Pubkey>,
 }
 
 impl TestEnv {
     fn new() -> Self {
+        Self::new_with_governance_bootstrap(true)
+    }
+
+    fn new_without_governance_bootstrap() -> Self {
+        Self::new_with_governance_bootstrap(false)
+    }
+
+    fn new_with_governance_bootstrap(bootstrap_governance: bool) -> Self {
         let mut svm = LiteSVM::new();
 
-        let percolator_id = Pubkey::new_unique();
+        let percolator_id = percolator_prog::id();
         let perc_bytes = std::fs::read(percolator_path()).expect("read percolator BPF");
         svm.add_program(percolator_id, &perc_bytes);
 
@@ -481,19 +508,19 @@ impl TestEnv {
         svm.airdrop(&dao_authority.pubkey(), 100_000_000_000)
             .unwrap();
 
-        // COIN mint — authority is the rewards PDA derived from coin_mint key
+        // COIN mint starts under DAO authority; bootstrap then hands minting to
+        // the rewards PDA after the governance adapter controller is recorded.
         let coin_mint = Pubkey::new_unique();
         let (mint_authority_pda, _) = Pubkey::find_program_address(
             &[b"coin_mint_authority", coin_mint.as_ref()],
             &rewards_id,
         );
-        let (governance_authority_pda, _) =
-            governance_authority_address(&rewards_id, &coin_mint);
+        let (governance_authority_pda, _) = governance_authority_address(&rewards_id, &coin_mint);
         svm.set_account(
             coin_mint,
             Account {
                 lamports: 1_000_000,
-                data: make_mint_data_with_authority(&mint_authority_pda),
+                data: make_mint_data_with_authority(&dao_authority.pubkey()),
                 owner: spl_token::ID,
                 executable: false,
                 rent_epoch: 0,
@@ -501,25 +528,45 @@ impl TestEnv {
         )
         .unwrap();
 
-        let ix = Instruction {
-            program_id: governance_id,
-            accounts: vec![
-                AccountMeta::new(dao_authority.pubkey(), true),
-                AccountMeta::new(governance_authority_pda, false),
-                AccountMeta::new_readonly(rewards_id, false),
-                AccountMeta::new_readonly(coin_mint, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
-            data: encode_governance_init_authority(),
-        };
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&dao_authority.pubkey()),
-            &[&dao_authority],
-            svm.latest_blockhash(),
-        );
-        svm.send_transaction(tx)
-            .expect("governance init_authority failed");
+        if bootstrap_governance {
+            let ix = Instruction {
+                program_id: governance_id,
+                accounts: vec![
+                    AccountMeta::new(dao_authority.pubkey(), true),
+                    AccountMeta::new(governance_authority_pda, false),
+                    AccountMeta::new_readonly(rewards_id, false),
+                    AccountMeta::new_readonly(coin_mint, false),
+                    AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                ],
+                data: encode_governance_init_authority(),
+            };
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&dao_authority.pubkey()),
+                &[&dao_authority],
+                svm.latest_blockhash(),
+            );
+            svm.send_transaction(tx)
+                .expect("governance init_authority failed");
+
+            let ix = spl_token::instruction::set_authority(
+                &spl_token::ID,
+                &coin_mint,
+                Some(&mint_authority_pda),
+                AuthorityType::MintTokens,
+                &dao_authority.pubkey(),
+                &[],
+            )
+            .unwrap();
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&dao_authority.pubkey()),
+                &[&dao_authority],
+                svm.latest_blockhash(),
+            );
+            svm.send_transaction(tx)
+                .expect("mint authority handoff failed");
+        }
 
         // Init percolator market
         let dummy_ata = Pubkey::new_unique();
@@ -564,6 +611,40 @@ impl TestEnv {
         );
         svm.send_transaction(tx).expect("init_market failed");
 
+        let ix = Instruction {
+            program_id: percolator_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: encode_set_insurance_withdraw_policy(&payer.pubkey(), 0, 10_000, 1),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(tx)
+            .expect("set insurance withdraw policy failed");
+
+        let ix = Instruction {
+            program_id: percolator_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: encode_configure_permissionless_resolve(2_000, 100),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(tx)
+            .expect("configure permissionless resolve failed");
+
         TestEnv {
             svm,
             percolator_id,
@@ -579,7 +660,55 @@ impl TestEnv {
             coin_mint,
             mint_authority_pda,
             account_count: 0,
+            percolator_portfolios: Vec::new(),
         }
+    }
+
+    fn try_init_governance_authority(&mut self, signer: &Keypair) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.governance_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.governance_authority_pda, false),
+                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: encode_governance_init_authority(),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn handoff_mint_authority_to_rewards(&mut self) {
+        let ix = spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &self.coin_mint,
+            Some(&self.mint_authority_pda),
+            AuthorityType::MintTokens,
+            &self.dao_authority.pubkey(),
+            &[],
+        )
+        .unwrap();
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&self.dao_authority.pubkey()),
+            &[&self.dao_authority],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("mint authority handoff failed");
     }
 
     fn init_coin_config(&mut self) {
@@ -594,10 +723,8 @@ impl TestEnv {
         authority: &Keypair,
         coin_mint: &Pubkey,
     ) -> Result<(), String> {
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", coin_mint.as_ref()],
-            &self.rewards_id,
-        );
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", coin_mint.as_ref()], &self.rewards_id);
 
         let ix = Instruction {
             program_id: self.rewards_id,
@@ -623,10 +750,8 @@ impl TestEnv {
     }
 
     fn try_init_coin_config_with_mint(&mut self, coin_mint: &Pubkey) -> Result<(), String> {
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", coin_mint.as_ref()],
-            &self.rewards_id,
-        );
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", coin_mint.as_ref()], &self.rewards_id);
 
         let ix = Instruction {
             program_id: self.governance_id,
@@ -661,11 +786,7 @@ impl TestEnv {
             .expect("init_market_rewards failed");
     }
 
-    fn try_init_market_rewards(
-        &mut self,
-        n: u64,
-        epoch_slots: u64,
-    ) -> Result<(), String> {
+    fn try_init_market_rewards(&mut self, n: u64, epoch_slots: u64) -> Result<(), String> {
         let slab = self.slab;
         self.try_init_market_rewards_for_slab(&slab, n, epoch_slots)
     }
@@ -676,28 +797,42 @@ impl TestEnv {
         n: u64,
         epoch_slots: u64,
     ) -> Result<(), String> {
-        let (mrc_pda, _) =
-            Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", self.coin_mint.as_ref()],
-            &self.rewards_id,
-        );
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()],
-            &self.rewards_id,
-        );
+        let signer = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
+        let collateral_mint = self.collateral_mint;
+        self.try_init_market_rewards_for_slab_with_signer(
+            slab,
+            n,
+            epoch_slots,
+            &signer,
+            &collateral_mint,
+        )
+    }
+
+    fn try_init_market_rewards_for_slab_with_signer(
+        &mut self,
+        slab: &Pubkey,
+        n: u64,
+        epoch_slots: u64,
+        signer: &Keypair,
+        collateral_mint: &Pubkey,
+    ) -> Result<(), String> {
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
 
         let ix = Instruction {
             program_id: self.governance_id,
             accounts: vec![
-                AccountMeta::new(self.dao_authority.pubkey(), true),
+                AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.governance_authority_pda, false),
                 AccountMeta::new_readonly(self.rewards_id, false),
                 AccountMeta::new_readonly(*slab, false),
                 AccountMeta::new(mrc_pda, false),
                 AccountMeta::new_readonly(self.coin_mint, false),
                 AccountMeta::new_readonly(coin_cfg_pda, false),
-                AccountMeta::new_readonly(self.collateral_mint, false),
+                AccountMeta::new_readonly(*collateral_mint, false),
                 AccountMeta::new(stake_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::rent::ID, false),
@@ -707,8 +842,8 @@ impl TestEnv {
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&self.dao_authority.pubkey()),
-            &[&self.dao_authority],
+            Some(&signer.pubkey()),
+            &[signer],
             self.svm.latest_blockhash(),
         );
         self.svm
@@ -724,7 +859,7 @@ impl TestEnv {
 
     fn burn_market_admin_for_slab(&mut self, slab: &Pubkey) {
         let slab_account = self.svm.get_account(slab).expect("slab account missing");
-        let header = percolator_prog::state::read_header(&slab_account.data);
+        let header = read_percolator_config(&slab_account.data);
         if header.admin == [0u8; 32] {
             return;
         }
@@ -756,8 +891,7 @@ impl TestEnv {
     /// Must be called BEFORE admin burn (admin signs here).
     fn register_insurance_operator_for_slab(&mut self, slab: &Pubkey) {
         let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
-        let (mrc_pda, _) = Pubkey::find_program_address(
-            &[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
 
         let ix = Instruction {
             program_id: self.rewards_id,
@@ -787,10 +921,8 @@ impl TestEnv {
     }
 
     fn try_stake(&mut self, user: &Keypair, amount: u64) -> Result<(), String> {
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
         let (sp_pda, _) = Pubkey::find_program_address(
             &[b"sp", self.slab.as_ref(), user.pubkey().as_ref()],
             &self.rewards_id,
@@ -798,7 +930,14 @@ impl TestEnv {
 
         let col_mint = self.collateral_mint;
         let user_ata = self.create_ata(&col_mint, &user.pubkey(), amount);
-        self.try_stake_with_accounts(user, amount, &user_ata, &stake_vault, &sp_pda, &spl_token::ID)
+        self.try_stake_with_accounts(
+            user,
+            amount,
+            &user_ata,
+            &stake_vault,
+            &sp_pda,
+            &spl_token::ID,
+        )
     }
 
     fn try_stake_with_accounts(
@@ -816,12 +955,12 @@ impl TestEnv {
         let ix = Instruction {
             program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(user.pubkey(), true),           // [0] user
-                AccountMeta::new(mrc_pda, false),                // [1] mrc
-                AccountMeta::new_readonly(self.slab, false),     // [2] market_slab
-                AccountMeta::new(*user_ata, false),              // [3] user_collateral_ata
-                AccountMeta::new(*stake_vault, false),           // [4] stake_vault
-                AccountMeta::new(*sp_pda, false),                // [5] stake_position
+                AccountMeta::new(user.pubkey(), true),            // [0] user
+                AccountMeta::new(mrc_pda, false),                 // [1] mrc
+                AccountMeta::new_readonly(self.slab, false),      // [2] market_slab
+                AccountMeta::new(*user_ata, false),               // [3] user_collateral_ata
+                AccountMeta::new(*stake_vault, false),            // [4] stake_vault
+                AccountMeta::new(*sp_pda, false),                 // [5] stake_position
                 AccountMeta::new_readonly(*token_program, false), // [6] token_program
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false), // [7] system
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // [8] clock
@@ -846,10 +985,8 @@ impl TestEnv {
     }
 
     fn try_unstake(&mut self, user: &Keypair, amount: u64) -> Result<(), String> {
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
         let (sp_pda, _) = Pubkey::find_program_address(
             &[b"sp", self.slab.as_ref(), user.pubkey().as_ref()],
             &self.rewards_id,
@@ -876,16 +1013,16 @@ impl TestEnv {
         let ix = Instruction {
             program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(user.pubkey(), true),               // [0] user
-                AccountMeta::new(mrc_pda, false),                    // [1] mrc
-                AccountMeta::new_readonly(self.slab, false),         // [2] market_slab
-                AccountMeta::new(*user_ata, false),                  // [3] user_collateral_ata
-                AccountMeta::new(*stake_vault, false),               // [4] stake_vault
-                AccountMeta::new(*sp_pda, false),                    // [5] stake_position
-                AccountMeta::new(self.coin_mint, false),             // [6] coin_mint
-                AccountMeta::new(*coin_ata, false),                  // [7] user_coin_ata
+                AccountMeta::new(user.pubkey(), true),       // [0] user
+                AccountMeta::new(mrc_pda, false),            // [1] mrc
+                AccountMeta::new_readonly(self.slab, false), // [2] market_slab
+                AccountMeta::new(*user_ata, false),          // [3] user_collateral_ata
+                AccountMeta::new(*stake_vault, false),       // [4] stake_vault
+                AccountMeta::new(*sp_pda, false),            // [5] stake_position
+                AccountMeta::new(self.coin_mint, false),     // [6] coin_mint
+                AccountMeta::new(*coin_ata, false),          // [7] user_coin_ata
                 AccountMeta::new_readonly(self.mint_authority_pda, false), // [8] mint_authority
-                AccountMeta::new_readonly(spl_token::ID, false),     // [9] token_program
+                AccountMeta::new_readonly(spl_token::ID, false), // [9] token_program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // [10] clock
             ],
             data: encode_unstake(amount),
@@ -906,10 +1043,8 @@ impl TestEnv {
     fn unstake_and_get_atas(&mut self, user: &Keypair, amount: u64) -> (Pubkey, Pubkey) {
         let (mrc_pda, _) =
             Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
         let (sp_pda, _) = Pubkey::find_program_address(
             &[b"sp", self.slab.as_ref(), user.pubkey().as_ref()],
             &self.rewards_id,
@@ -972,14 +1107,14 @@ impl TestEnv {
         let ix = Instruction {
             program_id: self.rewards_id,
             accounts: vec![
-                AccountMeta::new(user.pubkey(), true),               // [0] user
-                AccountMeta::new(mrc_pda, false),                    // [1] mrc
-                AccountMeta::new_readonly(self.slab, false),         // [2] market_slab
-                AccountMeta::new(sp_pda, false),                     // [3] stake_position
-                AccountMeta::new(self.coin_mint, false),             // [4] coin_mint
-                AccountMeta::new(*coin_ata, false),                  // [5] user_coin_ata
+                AccountMeta::new(user.pubkey(), true),       // [0] user
+                AccountMeta::new(mrc_pda, false),            // [1] mrc
+                AccountMeta::new_readonly(self.slab, false), // [2] market_slab
+                AccountMeta::new(sp_pda, false),             // [3] stake_position
+                AccountMeta::new(self.coin_mint, false),     // [4] coin_mint
+                AccountMeta::new(*coin_ata, false),          // [5] user_coin_ata
                 AccountMeta::new_readonly(self.mint_authority_pda, false), // [6] mint_authority
-                AccountMeta::new_readonly(spl_token::ID, false),     // [7] token_program
+                AccountMeta::new_readonly(spl_token::ID, false), // [7] token_program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // [8] clock
             ],
             data: encode_claim_stake_rewards(),
@@ -1043,18 +1178,28 @@ impl TestEnv {
     fn init_user(&mut self, owner: &Keypair) -> u16 {
         let idx = self.account_count;
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let col_mint = self.collateral_mint;
-        let _ata = self.create_ata(&col_mint, &owner.pubkey(), 1_000_000);
+        let portfolio = Pubkey::new_unique();
+        let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1)
+            .expect("portfolio account len");
+        self.svm
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; portfolio_len],
+                    owner: self.percolator_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
 
         let ix = Instruction {
             program_id: self.percolator_id,
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.slab, false),
-                AccountMeta::new(_ata, false),
-                AccountMeta::new(self.vault, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new(portfolio, false),
             ],
             data: encode_init_user(1_000_000),
         };
@@ -1065,6 +1210,7 @@ impl TestEnv {
             self.svm.latest_blockhash(),
         );
         self.svm.send_transaction(tx).expect("init_user failed");
+        self.percolator_portfolios.push(portfolio);
         self.account_count += 1;
         idx
     }
@@ -1072,15 +1218,19 @@ impl TestEnv {
     fn deposit(&mut self, owner: &Keypair, idx: u16, amount: u64) {
         let col_mint = self.collateral_mint;
         let ata = self.create_ata(&col_mint, &owner.pubkey(), amount);
+        let portfolio = *self
+            .percolator_portfolios
+            .get(idx as usize)
+            .expect("missing test portfolio");
         let ix = Instruction {
             program_id: self.percolator_id,
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.slab, false),
+                AccountMeta::new(portfolio, false),
                 AccountMeta::new(ata, false),
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_deposit(idx, amount),
         };
@@ -1155,11 +1305,14 @@ impl TestEnv {
         token.amount
     }
 
+    fn read_mint(&self, mint: &Pubkey) -> Mint {
+        let data = self.svm.get_account(mint).unwrap();
+        Mint::unpack(&data.data).unwrap()
+    }
+
     fn vault_balance(&self) -> u64 {
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
         self.read_token_balance(&stake_vault)
     }
 
@@ -1169,16 +1322,22 @@ impl TestEnv {
     }
 
     fn try_draw_insurance(&mut self, amount: u64, destination: &Pubkey) -> Result<(), String> {
+        let signer = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
+        self.try_draw_insurance_with_signer(&signer, amount, destination)
+    }
+
+    fn try_draw_insurance_with_signer(
+        &mut self,
+        signer: &Keypair,
+        amount: u64,
+        destination: &Pubkey,
+    ) -> Result<(), String> {
         let (mrc_pda, _) =
             Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", self.coin_mint.as_ref()],
-            &self.rewards_id,
-        );
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
 
         let mut data = vec![3u8]; // governance adapter IX_DRAW_INSURANCE
         data.extend_from_slice(&amount.to_le_bytes());
@@ -1186,7 +1345,7 @@ impl TestEnv {
         let ix = Instruction {
             program_id: self.governance_id,
             accounts: vec![
-                AccountMeta::new(self.dao_authority.pubkey(), true),
+                AccountMeta::new(signer.pubkey(), true),
                 AccountMeta::new(self.governance_authority_pda, false),
                 AccountMeta::new_readonly(self.rewards_id, false),
                 AccountMeta::new_readonly(mrc_pda, false),
@@ -1201,8 +1360,8 @@ impl TestEnv {
         };
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&self.dao_authority.pubkey()),
-            &[&self.dao_authority],
+            Some(&signer.pubkey()),
+            &[signer],
             self.svm.latest_blockhash(),
         );
         self.svm
@@ -1219,14 +1378,10 @@ impl TestEnv {
     ) -> Result<(), String> {
         let (mrc_pda, _) =
             Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", self.coin_mint.as_ref()],
-            &self.rewards_id,
-        );
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", self.slab.as_ref()],
-            &self.rewards_id,
-        );
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", self.slab.as_ref()], &self.rewards_id);
 
         let mut data = vec![5u8]; // rewards program IX_DRAW_INSURANCE directly
         data.extend_from_slice(&amount.to_le_bytes());
@@ -1258,6 +1413,112 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    fn try_governance_mint_reward(
+        &mut self,
+        signer: &Keypair,
+        amount: u64,
+        destination: &Pubkey,
+    ) -> Result<(), String> {
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let ix = Instruction {
+            program_id: self.governance_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.governance_authority_pda, false),
+                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new(self.coin_mint, false),
+                AccountMeta::new_readonly(coin_cfg_pda, false),
+                AccountMeta::new(*destination, false),
+                AccountMeta::new_readonly(self.mint_authority_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_governance_mint_reward(amount),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_set_market_rewards(
+        &mut self,
+        signer: &Keypair,
+        n: u64,
+        epoch_slots: u64,
+    ) -> Result<(), String> {
+        let (mrc_pda, _) =
+            Pubkey::find_program_address(&[b"mrc", self.slab.as_ref()], &self.rewards_id);
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let ix = Instruction {
+            program_id: self.governance_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.governance_authority_pda, false),
+                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new(mrc_pda, false),
+                AccountMeta::new_readonly(self.slab, false),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(coin_cfg_pda, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_governance_set_market_rewards(n, epoch_slots),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_transfer_mint_authority(
+        &mut self,
+        signer: &Keypair,
+        new_authority: &Pubkey,
+    ) -> Result<(), String> {
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let ix = Instruction {
+            program_id: self.governance_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new(self.governance_authority_pda, false),
+                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new(self.coin_mint, false),
+                AccountMeta::new_readonly(coin_cfg_pda, false),
+                AccountMeta::new_readonly(self.mint_authority_pda, false),
+                AccountMeta::new_readonly(*new_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_governance_transfer_mint_authority(),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&signer.pubkey()),
+            &[signer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
     // ========================================================================
     // Multi-market helpers
     // ========================================================================
@@ -1266,30 +1527,45 @@ impl TestEnv {
     fn init_second_market(&mut self, n_per_epoch: u64, epoch_slots: u64) -> Pubkey {
         let slab2 = Pubkey::new_unique();
         let vault2 = Pubkey::new_unique();
-        let (vault2_pda, _) = Pubkey::find_program_address(
-            &[b"vault", slab2.as_ref()], &self.percolator_id);
-        self.svm.set_account(slab2, Account {
-            lamports: 1_000_000_000,
-            data: vec![0u8; SLAB_LEN],
-            owner: self.percolator_id,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
-        self.svm.set_account(vault2, Account {
-            lamports: 1_000_000,
-            data: make_token_account_data(&self.collateral_mint, &vault2_pda, 0),
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        let (vault2_pda, _) =
+            Pubkey::find_program_address(&[b"vault", slab2.as_ref()], &self.percolator_id);
+        self.svm
+            .set_account(
+                slab2,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; SLAB_LEN],
+                    owner: self.percolator_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.svm
+            .set_account(
+                vault2,
+                Account {
+                    lamports: 1_000_000,
+                    data: make_token_account_data(&self.collateral_mint, &vault2_pda, 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
         let dummy_ata2 = Pubkey::new_unique();
-        self.svm.set_account(dummy_ata2, Account {
-            lamports: 1_000_000,
-            data: vec![0u8; TokenAccount::LEN],
-            owner: spl_token::ID,
-            executable: false,
-            rent_epoch: 0,
-        }).unwrap();
+        self.svm
+            .set_account(
+                dummy_ata2,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![0u8; TokenAccount::LEN],
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
         let ix = Instruction {
             program_id: self.percolator_id,
             accounts: vec![
@@ -1304,13 +1580,58 @@ impl TestEnv {
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market(
-                &self.payer.pubkey(), &self.collateral_mint, &TEST_FEED_ID, 0),
+                &self.payer.pubkey(),
+                &self.collateral_mint,
+                &TEST_FEED_ID,
+                0,
+            ),
         };
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
         let tx = Transaction::new_signed_with_payer(
-            &[cu_ix, ix], Some(&self.payer.pubkey()),
-            &[&self.payer], self.svm.latest_blockhash());
-        self.svm.send_transaction(tx).expect("init_second_market failed");
+            &[cu_ix, ix],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("init_second_market failed");
+        let ix = Instruction {
+            program_id: self.percolator_id,
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(slab2, false),
+            ],
+            data: encode_set_insurance_withdraw_policy(&self.payer.pubkey(), 0, 10_000, 1),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("set second market insurance policy failed");
+        let ix = Instruction {
+            program_id: self.percolator_id,
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new(slab2, false),
+            ],
+            data: encode_configure_permissionless_resolve(2_000, 100),
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("configure second market permissionless resolve failed");
         self.register_insurance_operator_for_slab(&slab2);
         self.burn_market_admin_for_slab(&slab2);
         self.try_init_market_rewards_for_slab(&slab2, n_per_epoch, epoch_slots)
@@ -1319,19 +1640,46 @@ impl TestEnv {
     }
 
     fn vault_balance_for(&self, slab: &Pubkey) -> u64 {
-        let (vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
         self.read_token_balance(&vault)
+    }
+
+    fn percolator_vault_for_slab(&mut self, slab: &Pubkey) -> Pubkey {
+        if *slab == self.slab {
+            return self.vault;
+        }
+
+        let (vault_authority, _) =
+            Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
+        let (vault_token, _) =
+            Pubkey::find_program_address(&[b"test_perc_vault", slab.as_ref()], &self.rewards_id);
+        if self.svm.get_account(&vault_token).is_none() {
+            self.svm
+                .set_account(
+                    vault_token,
+                    Account {
+                        lamports: 1_000_000,
+                        data: make_token_account_data(&self.collateral_mint, &vault_authority, 0),
+                        owner: spl_token::ID,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
+        vault_token
     }
 
     /// Stake into a specific market.
     fn stake_in(&mut self, slab: &Pubkey, user: &Keypair, amount: u64) {
-        let (mrc_pda, _) = Pubkey::find_program_address(
-            &[b"mrc", slab.as_ref()], &self.rewards_id);
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
         let (sp_pda, _) = Pubkey::find_program_address(
-            &[b"sp", slab.as_ref(), user.pubkey().as_ref()], &self.rewards_id);
+            &[b"sp", slab.as_ref(), user.pubkey().as_ref()],
+            &self.rewards_id,
+        );
         let col_mint = self.collateral_mint;
         let user_ata = self.create_ata(&col_mint, &user.pubkey(), amount);
         let ix = Instruction {
@@ -1351,19 +1699,28 @@ impl TestEnv {
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()),
-            &[user], self.svm.latest_blockhash());
+            &[ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
+        );
         self.svm.send_transaction(tx).expect("stake_in failed");
     }
 
     /// Unstake from a specific market. Returns (collateral_ata, coin_ata).
-    fn unstake_in_get_atas(&mut self, slab: &Pubkey, user: &Keypair, amount: u64) -> (Pubkey, Pubkey) {
-        let (mrc_pda, _) = Pubkey::find_program_address(
-            &[b"mrc", slab.as_ref()], &self.rewards_id);
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+    fn unstake_in_get_atas(
+        &mut self,
+        slab: &Pubkey,
+        user: &Keypair,
+        amount: u64,
+    ) -> (Pubkey, Pubkey) {
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
         let (sp_pda, _) = Pubkey::find_program_address(
-            &[b"sp", slab.as_ref(), user.pubkey().as_ref()], &self.rewards_id);
+            &[b"sp", slab.as_ref(), user.pubkey().as_ref()],
+            &self.rewards_id,
+        );
         let col_mint = self.collateral_mint;
         let user_ata = self.create_ata(&col_mint, &user.pubkey(), 0);
         let coin_ata = self.create_coin_ata(&user.pubkey(), 0);
@@ -1386,8 +1743,11 @@ impl TestEnv {
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&user.pubkey()),
-            &[user], self.svm.latest_blockhash());
+            &[ix],
+            Some(&user.pubkey()),
+            &[user],
+            self.svm.latest_blockhash(),
+        );
         self.svm.send_transaction(tx).expect("unstake_in failed");
         (user_ata, coin_ata)
     }
@@ -1399,14 +1759,16 @@ impl TestEnv {
     }
 
     fn try_draw_insurance_from(
-        &mut self, slab: &Pubkey, amount: u64, destination: &Pubkey,
+        &mut self,
+        slab: &Pubkey,
+        amount: u64,
+        destination: &Pubkey,
     ) -> Result<(), String> {
-        let (mrc_pda, _) = Pubkey::find_program_address(
-            &[b"mrc", slab.as_ref()], &self.rewards_id);
-        let (coin_cfg_pda, _) = Pubkey::find_program_address(
-            &[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (coin_cfg_pda, _) =
+            Pubkey::find_program_address(&[b"coin_cfg", self.coin_mint.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
 
         let mut data = vec![3u8]; // governance adapter IX_DRAW_INSURANCE
         data.extend_from_slice(&amount.to_le_bytes());
@@ -1429,8 +1791,11 @@ impl TestEnv {
         };
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&self.dao_authority.pubkey()),
-            &[&self.dao_authority], self.svm.latest_blockhash());
+            &[ix],
+            Some(&self.dao_authority.pubkey()),
+            &[&self.dao_authority],
+            self.svm.latest_blockhash(),
+        );
         self.svm
             .send_transaction(tx)
             .map(|_| ())
@@ -1439,59 +1804,60 @@ impl TestEnv {
 
     /// Inject "profit" into a vault by sending tokens directly (bypasses stake).
     fn inject_profit(&mut self, slab: &Pubkey, amount: u64) {
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
         let col_mint = self.collateral_mint;
         let donor_ata = self.create_ata(&col_mint, &self.dao_authority.pubkey(), amount);
         let xfer = spl_token::instruction::transfer(
-            &spl_token::ID, &donor_ata, &stake_vault,
-            &self.dao_authority.pubkey(), &[], amount,
-        ).unwrap();
+            &spl_token::ID,
+            &donor_ata,
+            &stake_vault,
+            &self.dao_authority.pubkey(),
+            &[],
+            amount,
+        )
+        .unwrap();
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[xfer], Some(&self.dao_authority.pubkey()),
-            &[&self.dao_authority], self.svm.latest_blockhash());
+            &[xfer],
+            Some(&self.dao_authority.pubkey()),
+            &[&self.dao_authority],
+            self.svm.latest_blockhash(),
+        );
         self.svm.send_transaction(tx).expect("inject_profit failed");
     }
 
-    /// Top up percolator's insurance fund directly via percolator::TopUpInsurance
-    /// (permissionless, any donor can call). Simulates fees/profit accruing in
-    /// the percolator market's insurance fund.
+    /// Top up percolator's insurance fund directly via percolator::TopUpInsurance.
+    /// Current percolator v16 gates this by the market insurance authority.
     fn topup_percolator_insurance(&mut self, slab: &Pubkey, amount: u64) {
-        let donor = Keypair::new();
-        self.svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
         let col_mint = self.collateral_mint;
-        let donor_ata = self.create_ata(&col_mint, &donor.pubkey(), amount);
+        let signer = self.payer.pubkey();
+        let source_ata = self.create_ata(&col_mint, &signer, amount);
 
-        // The percolator vault for a given slab is stored in MarketConfig.
-        // For the default env.slab we use env.vault; for new slabs we look up.
-        let perc_vault = if *slab == self.slab {
-            self.vault
-        } else {
-            // Need to get from MarketConfig — stored at known offset in slab.
-            let slab_data = self.svm.get_account(slab).unwrap().data;
-            let config = percolator_prog::state::read_config(&slab_data);
-            Pubkey::new_from_array(config.vault_pubkey)
-        };
+        let perc_vault = self.percolator_vault_for_slab(slab);
 
         let ix = Instruction {
             program_id: self.percolator_id,
             accounts: vec![
-                AccountMeta::new(donor.pubkey(), true),
+                AccountMeta::new(signer, true),
                 AccountMeta::new(*slab, false),
-                AccountMeta::new(donor_ata, false),
+                AccountMeta::new(source_ata, false),
                 AccountMeta::new(perc_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
             ],
             data: encode_topup_insurance(amount),
         };
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[cu_ix, ix], Some(&donor.pubkey()),
-            &[&donor], self.svm.latest_blockhash());
-        self.svm.send_transaction(tx).expect("topup_percolator_insurance failed");
+            &[cu_ix, ix],
+            Some(&signer),
+            &[&self.payer],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("topup_percolator_insurance failed");
     }
 
     /// Call our rewards program's pull_insurance instruction, which CPIs
@@ -1499,20 +1865,23 @@ impl TestEnv {
     /// Returns Ok(()) on success, Err on failure (e.g., cooldown not elapsed,
     /// insufficient balance, MRC PDA not operator).
     fn try_pull_insurance(&mut self, slab: &Pubkey, amount: u64) -> Result<(), String> {
-        let (mrc_pda, _) = Pubkey::find_program_address(
-            &[b"mrc", slab.as_ref()], &self.rewards_id);
-        let (stake_vault, _) = Pubkey::find_program_address(
-            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
-        let (perc_vault_pda, _) = Pubkey::find_program_address(
-            &[b"vault", slab.as_ref()], &self.percolator_id);
+        let percolator_id = self.percolator_id;
+        self.try_pull_insurance_with_program(slab, amount, &percolator_id)
+    }
 
-        let perc_vault = if *slab == self.slab {
-            self.vault
-        } else {
-            let slab_data = self.svm.get_account(slab).unwrap().data;
-            let config = percolator_prog::state::read_config(&slab_data);
-            Pubkey::new_from_array(config.vault_pubkey)
-        };
+    fn try_pull_insurance_with_program(
+        &mut self,
+        slab: &Pubkey,
+        amount: u64,
+        percolator_program: &Pubkey,
+    ) -> Result<(), String> {
+        let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (stake_vault, _) =
+            Pubkey::find_program_address(&[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (perc_vault_pda, _) =
+            Pubkey::find_program_address(&[b"vault", slab.as_ref()], percolator_program);
+
+        let perc_vault = self.percolator_vault_for_slab(slab);
 
         let mut data = vec![7u8]; // IX_PULL_INSURANCE
         data.extend_from_slice(&amount.to_le_bytes());
@@ -1531,15 +1900,18 @@ impl TestEnv {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(perc_vault_pda, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
+                AccountMeta::new_readonly(*percolator_program, false),
             ],
             data,
         };
         let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
         self.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
-            &[cu_ix, ix], Some(&payer.pubkey()),
-            &[&payer], self.svm.latest_blockhash());
+            &[cu_ix, ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            self.svm.latest_blockhash(),
+        );
         self.svm
             .send_transaction(tx)
             .map(|_| ())
@@ -1551,16 +1923,12 @@ impl TestEnv {
             .expect("pull_insurance failed");
     }
 
-    /// Read the current percolator insurance fund balance from the slab's engine state.
-    /// Uses BPF-target byte offset (ENGINE_OFF=568, insurance_fund.balance at +16).
+    /// Read the current percolator insurance balance through the pinned v16 state view.
     fn percolator_insurance_balance(&self, slab: &Pubkey) -> u128 {
-        const INSURANCE_BALANCE_OFFSET: usize = 568 + 16;
-        let slab_data = self.svm.get_account(slab).unwrap().data;
-        u128::from_le_bytes(
-            slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
-                .try_into()
-                .unwrap(),
-        )
+        let mut slab_data = self.svm.get_account(slab).unwrap().data;
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut slab_data).expect("read market view");
+        group.header.insurance.get()
     }
 }
 
@@ -1689,8 +2057,7 @@ fn test_init_market_rewards_happy_path() {
 
     env.init_market_rewards(n, epoch_slots);
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let mrc_account = env.svm.get_account(&mrc_pda).unwrap();
     assert_eq!(mrc_account.owner, env.rewards_id);
     assert_eq!(mrc_account.data.len(), 160); // MRC_SIZE
@@ -1703,8 +2070,7 @@ fn test_init_market_rewards_happy_path() {
     let stored_mint = Pubkey::new_from_array(mrc_account.data[40..72].try_into().unwrap());
     assert_eq!(stored_mint, env.coin_mint);
 
-    let stored_collateral =
-        Pubkey::new_from_array(mrc_account.data[72..104].try_into().unwrap());
+    let stored_collateral = Pubkey::new_from_array(mrc_account.data[72..104].try_into().unwrap());
     assert_eq!(stored_collateral, env.collateral_mint);
 
     let stored_n = u64::from_le_bytes(mrc_account.data[104..112].try_into().unwrap());
@@ -1717,10 +2083,8 @@ fn test_init_market_rewards_happy_path() {
     assert_eq!(stored_start, 100); // clock was set to 100 during init
 
     // Verify stake vault was created
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_account = env.svm.get_account(&stake_vault).unwrap();
     assert_eq!(vault_account.owner, spl_token::ID);
     let vault_token = TokenAccount::unpack(&vault_account.data).unwrap();
@@ -1751,27 +2115,32 @@ fn test_trusted_bootstrap_ceremony_flow() {
 
     // Step 1: initialize CoinConfig through that governed path.
     env.init_coin_config();
-    let (coin_cfg_pda, _) = Pubkey::find_program_address(
-        &[b"coin_cfg", env.coin_mint.as_ref()],
-        &env.rewards_id,
-    );
-    let coin_cfg = env.svm.get_account(&coin_cfg_pda).expect("coin config must exist");
+    let (coin_cfg_pda, _) =
+        Pubkey::find_program_address(&[b"coin_cfg", env.coin_mint.as_ref()], &env.rewards_id);
+    let coin_cfg = env
+        .svm
+        .get_account(&coin_cfg_pda)
+        .expect("coin config must exist");
     let stored_auth = Pubkey::new_from_array(coin_cfg.data[8..40].try_into().unwrap());
     assert_eq!(stored_auth, env.governance_authority_pda);
 
     // Step 2: reward init is blocked until Percolator admin is burned.
-    let live_header =
-        percolator_prog::state::read_header(&env.svm.get_account(&env.slab).unwrap().data);
-    assert_eq!(Pubkey::new_from_array(live_header.admin), env.payer.pubkey());
+    let live_header = read_percolator_config(&env.svm.get_account(&env.slab).unwrap().data);
+    assert_eq!(
+        Pubkey::new_from_array(live_header.admin),
+        env.payer.pubkey()
+    );
     let result = env.try_init_market_rewards(1000, 216_000);
-    assert!(result.is_err(), "live-admin slab should be rejected before burn");
+    assert!(
+        result.is_err(),
+        "live-admin slab should be rejected before burn"
+    );
     env.advance_blockhash();
 
     // Step 3: register MRC PDA as insurance_operator, then burn admin.
     env.register_insurance_operator_for_slab(&env.slab.clone());
     env.burn_market_admin();
-    let burned_header =
-        percolator_prog::state::read_header(&env.svm.get_account(&env.slab).unwrap().data);
+    let burned_header = read_percolator_config(&env.svm.get_account(&env.slab).unwrap().data);
     assert_eq!(burned_header.admin, [0u8; 32], "admin must be burned");
     env.advance_blockhash();
 
@@ -1779,9 +2148,11 @@ fn test_trusted_bootstrap_ceremony_flow() {
     let slab = env.slab;
     env.try_init_market_rewards_for_slab(&slab, 1000, 216_000)
         .expect("reward init should succeed after admin burn");
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    let mrc = env.svm.get_account(&mrc_pda).expect("market rewards config must exist");
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let mrc = env
+        .svm
+        .get_account(&mrc_pda)
+        .expect("market rewards config must exist");
     assert_eq!(mrc.owner, env.rewards_id);
     let stored_start = u64::from_le_bytes(mrc.data[120..128].try_into().unwrap());
     assert_eq!(stored_start, 100);
@@ -1812,20 +2183,13 @@ fn test_init_market_rewards_wrong_authority_fails() {
     env.init_coin_config();
 
     let attacker = Keypair::new();
-    env.svm
-        .airdrop(&attacker.pubkey(), 10_000_000_000)
-        .unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    let (coin_cfg_pda, _) = Pubkey::find_program_address(
-        &[b"coin_cfg", env.coin_mint.as_ref()],
-        &env.rewards_id,
-    );
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (coin_cfg_pda, _) =
+        Pubkey::find_program_address(&[b"coin_cfg", env.coin_mint.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
 
     let ix = Instruction {
         program_id: env.rewards_id,
@@ -1852,6 +2216,208 @@ fn test_init_market_rewards_wrong_authority_fails() {
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Wrong authority should be rejected");
+}
+
+#[test]
+fn test_governance_init_authority_requires_current_mint_authority() {
+    let mut env = TestEnv::new_without_governance_bootstrap();
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+
+    let result = env.try_init_governance_authority(&attacker);
+    assert!(
+        result.is_err(),
+        "attacker must not initialize governance authority for a mint they do not control"
+    );
+    assert!(
+        env.svm.get_account(&env.governance_authority_pda).is_none(),
+        "failed first mover must not create authority PDA"
+    );
+
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    env.try_init_governance_authority(&dao)
+        .expect("mint authority should initialize governance adapter");
+    env.handoff_mint_authority_to_rewards();
+    env.init_coin_config();
+
+    let authority = env
+        .svm
+        .get_account(&env.governance_authority_pda)
+        .expect("authority account exists");
+    assert_eq!(&authority.data[..8], b"GAUTH001");
+    let stored_controller = Pubkey::new_from_array(authority.data[8..40].try_into().unwrap());
+    assert_eq!(stored_controller, env.dao_authority.pubkey());
+}
+
+#[test]
+fn test_governance_adapter_rejects_wrong_controller_market_init() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    let slab = env.slab;
+    env.register_insurance_operator_for_slab(&slab);
+    env.burn_market_admin();
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let collateral_mint = env.collateral_mint;
+    let result = env.try_init_market_rewards_for_slab_with_signer(
+        &slab,
+        50_000,
+        100,
+        &attacker,
+        &collateral_mint,
+    );
+    assert!(
+        result.is_err(),
+        "non-controller must not initialize rewards market"
+    );
+
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", slab.as_ref()], &env.rewards_id);
+    assert!(
+        env.svm.get_account(&mrc_pda).is_none(),
+        "rejected market init must not create MRC"
+    );
+}
+
+#[test]
+fn test_init_market_rewards_rejects_non_percolator_owned_slab() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    let slab = env.slab;
+    env.register_insurance_operator_for_slab(&slab);
+    env.burn_market_admin();
+
+    let real_slab_data = env.svm.get_account(&slab).unwrap().data;
+    let fake_slab = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            fake_slab,
+            Account {
+                lamports: 1_000_000,
+                data: real_slab_data,
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let result = env.try_init_market_rewards_for_slab(&fake_slab, 1000, 100);
+    assert!(
+        result.is_err(),
+        "byte-shaped slab not owned by Percolator must be rejected"
+    );
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", fake_slab.as_ref()], &env.rewards_id);
+    assert!(env.svm.get_account(&mrc_pda).is_none());
+}
+
+#[test]
+fn test_init_market_rewards_rejects_collateral_mint_mismatch() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    let slab = env.slab;
+    env.register_insurance_operator_for_slab(&slab);
+    env.burn_market_admin();
+
+    let wrong_collateral_mint = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            wrong_collateral_mint,
+            Account {
+                lamports: 1_000_000,
+                data: make_mint_data_no_authority(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    let result = env.try_init_market_rewards_for_slab_with_signer(
+        &slab,
+        1000,
+        100,
+        &dao,
+        &wrong_collateral_mint,
+    );
+    assert!(
+        result.is_err(),
+        "reward market collateral mint must match Percolator slab config"
+    );
+}
+
+// ============================================================================
+// Tests: governed reward mint lifecycle
+// ============================================================================
+
+#[test]
+fn test_governance_reward_lifecycle_mint_and_transfer_authority() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    let dao_dest = env.create_coin_ata(&env.dao_authority.pubkey(), 0);
+    env.try_governance_mint_reward(&dao, 123, &dao_dest)
+        .expect("controller should mint governed reward");
+    assert_eq!(env.read_token_balance(&dao_dest), 123);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let attacker_dest = env.create_coin_ata(&attacker.pubkey(), 0);
+    let result = env.try_governance_mint_reward(&attacker, 1, &attacker_dest);
+    assert!(
+        result.is_err(),
+        "non-controller must not drive governed reward minting"
+    );
+    assert_eq!(env.read_token_balance(&attacker_dest), 0);
+
+    let new_authority = Keypair::new();
+    env.svm.airdrop(&new_authority.pubkey(), 1_000_000).unwrap();
+    env.try_transfer_mint_authority(&dao, &new_authority.pubkey())
+        .expect("controller should transfer mint authority");
+    let mint = env.read_mint(&env.coin_mint);
+    assert_eq!(
+        mint.mint_authority,
+        solana_sdk::program_option::COption::Some(new_authority.pubkey())
+    );
+
+    let result = env.try_governance_mint_reward(&dao, 1, &dao_dest);
+    assert!(
+        result.is_err(),
+        "rewards PDA must stop minting after authority is transferred away"
+    );
+}
+
+#[test]
+fn test_governance_can_pause_market_rewards_without_erasing_accrual() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 1_000_000);
+
+    env.set_clock(150);
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    env.try_set_market_rewards(&dao, 0, 100)
+        .expect("controller should pause emissions");
+
+    env.set_clock(250);
+    let coin_ata = env.claim_stake_rewards(&user);
+    let coin_balance = env.read_token_balance(&coin_ata);
+    assert!(
+        (499..=500).contains(&coin_balance),
+        "only pre-pause accrual should be minted, got {coin_balance}"
+    );
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let result = env.try_set_market_rewards(&attacker, 10_000, 100);
+    assert!(
+        result.is_err(),
+        "non-controller must not retune market rewards"
+    );
 }
 
 // ============================================================================
@@ -1883,16 +2449,13 @@ fn test_stake_happy_path() {
     assert_eq!(amount, 1_000_000);
 
     // Verify vault received collateral
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_balance = env.read_token_balance(&stake_vault);
     assert_eq!(vault_balance, 1_000_000);
 
     // Verify MRC total_staked updated
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let mrc_data = env.svm.get_account(&mrc_pda).unwrap();
     let total_staked = u64::from_le_bytes(mrc_data.data[152..160].try_into().unwrap());
     assert_eq!(total_staked, 1_000_000);
@@ -1920,10 +2483,8 @@ fn test_stake_wrong_token_program_fails_with_incorrect_program_id() {
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
 
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
         &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
         &env.rewards_id,
@@ -2004,9 +2565,12 @@ fn test_withdraw_returns_collateral_and_rewards() {
     // COIN rewards minted: 1000 * (200-100) / 100 = ~1000 for 1 epoch elapsed
     // (integer truncation may lose up to 1 COIN)
     let coin_balance = env.read_token_balance(&coin_ata);
-    assert!(coin_balance >= 999 && coin_balance <= 1000, "Should get ~1000 COIN for 1 epoch, got {}", coin_balance);
+    assert!(
+        coin_balance >= 999 && coin_balance <= 1000,
+        "Should get ~1000 COIN for 1 epoch, got {}",
+        coin_balance
+    );
 }
-
 
 #[test]
 fn test_unstake_more_than_staked_fails() {
@@ -2043,7 +2607,11 @@ fn test_partial_unstake() {
     assert_eq!(col_balance, 500_000);
 
     let coin_balance = env.read_token_balance(&coin_ata);
-    assert!(coin_balance >= 999 && coin_balance <= 1000, "Full pending rewards ~1000, got {}", coin_balance);
+    assert!(
+        coin_balance >= 999 && coin_balance <= 1000,
+        "Full pending rewards ~1000, got {}",
+        coin_balance
+    );
 
     // Verify position still exists with remaining amount
     let (sp_pda, _) = Pubkey::find_program_address(
@@ -2069,10 +2637,8 @@ fn test_unstake_wrong_owner_destinations_fail() {
     let collateral_mint = env.collateral_mint;
     let attacker_col_ata = env.create_ata(&collateral_mint, &attacker, 0);
     let attacker_coin_ata = env.create_coin_ata(&attacker, 0);
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
         &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
         &env.rewards_id,
@@ -2141,7 +2707,11 @@ fn test_claim_rewards_without_withdrawing() {
 
     // 1000 * 50 / 100 = ~500 COIN (integer truncation may lose 1)
     let balance = env.read_token_balance(&coin_ata);
-    assert!(balance >= 499 && balance <= 500, "Should earn ~500 COIN for half epoch, got {}", balance);
+    assert!(
+        balance >= 499 && balance <= 500,
+        "Should earn ~500 COIN for half epoch, got {}",
+        balance
+    );
 }
 
 #[test]
@@ -2160,18 +2730,30 @@ fn test_claim_stake_rewards_multiple_times() {
     let coin_ata = env.create_coin_ata(&user.pubkey(), 0);
     env.claim_stake_rewards_to(&user, &coin_ata);
     let bal1 = env.read_token_balance(&coin_ata);
-    assert!(bal1 >= 999 && bal1 <= 1000, "~1000 for 1 epoch, got {}", bal1);
+    assert!(
+        bal1 >= 999 && bal1 <= 1000,
+        "~1000 for 1 epoch, got {}",
+        bal1
+    );
 
     // Claim again in same slot — should get 0 more
     env.advance_blockhash();
     env.claim_stake_rewards_to(&user, &coin_ata);
-    assert_eq!(env.read_token_balance(&coin_ata), bal1, "No extra in same slot");
+    assert_eq!(
+        env.read_token_balance(&coin_ata),
+        bal1,
+        "No extra in same slot"
+    );
 
     // Advance to slot 400 (3 total epochs from start)
     env.set_clock(400);
     env.claim_stake_rewards_to(&user, &coin_ata);
     let bal3 = env.read_token_balance(&coin_ata);
-    assert!(bal3 >= 2997 && bal3 <= 3000, "~3000 for 3 epochs, got {}", bal3);
+    assert!(
+        bal3 >= 2997 && bal3 <= 3000,
+        "~3000 for 3 epochs, got {}",
+        bal3
+    );
 }
 
 #[test]
@@ -2241,12 +2823,20 @@ fn test_two_users_equal_stake() {
     let bal_b = env.read_token_balance(&ata_b);
 
     // Each gets half: 1000 * 1 / 2 = ~500 (rounding: up to 1 token lost per user)
-    assert!(bal_a >= 499 && bal_a <= 500, "Alice gets ~50%, got {}", bal_a);
+    assert!(
+        bal_a >= 499 && bal_a <= 500,
+        "Alice gets ~50%, got {}",
+        bal_a
+    );
     assert!(bal_b >= 499 && bal_b <= 500, "Bob gets ~50%, got {}", bal_b);
     // Conservation: total emitted must equal ~1000 (1 epoch).
     // Each user may lose up to 1 token to fixed-point truncation.
     let total = bal_a + bal_b;
-    assert!(total >= 998 && total <= 1000, "Total COIN must be ~1000, got {}", total);
+    assert!(
+        total >= 998 && total <= 1000,
+        "Total COIN must be ~1000, got {}",
+        total
+    );
 }
 
 #[test]
@@ -2274,11 +2864,19 @@ fn test_two_users_different_amounts() {
     let bal_b = env.read_token_balance(&ata_b);
 
     // Alice: 1000 * 3M / 4M = ~750, Bob: 1000 * 1M / 4M = ~250
-    assert!(bal_a >= 749 && bal_a <= 750, "Alice gets ~75%, got {}", bal_a);
+    assert!(
+        bal_a >= 749 && bal_a <= 750,
+        "Alice gets ~75%, got {}",
+        bal_a
+    );
     assert!(bal_b >= 249 && bal_b <= 250, "Bob gets ~25%, got {}", bal_b);
     // Conservation: total emitted ≤ 1000 (1 epoch), lost up to 1 per user
     let total = bal_a + bal_b;
-    assert!(total >= 998 && total <= 1000, "Total COIN must be ~1000, got {}", total);
+    assert!(
+        total >= 998 && total <= 1000,
+        "Total COIN must be ~1000, got {}",
+        total
+    );
 }
 
 #[test]
@@ -2312,11 +2910,19 @@ fn test_staker_joins_later() {
 
     // Alice: epoch [100..200] alone = ~1000, epoch [200..300] shared = ~500 => ~1500
     // Bob: epoch [200..300] shared = ~500
-    assert!(bal_a >= 1498 && bal_a <= 1500, "Alice: ~1500, got {}", bal_a);
+    assert!(
+        bal_a >= 1498 && bal_a <= 1500,
+        "Alice: ~1500, got {}",
+        bal_a
+    );
     assert!(bal_b >= 499 && bal_b <= 500, "Bob: ~500, got {}", bal_b);
     // Conservation: 2 epochs elapsed = ~2000 total COIN (up to 1 per user truncation)
     let total = bal_a + bal_b;
-    assert!(total >= 1996 && total <= 2000, "Total COIN must be ~2000, got {}", total);
+    assert!(
+        total >= 1996 && total <= 2000,
+        "Total COIN must be ~2000, got {}",
+        total
+    );
 }
 
 #[test]
@@ -2384,8 +2990,11 @@ fn test_two_users_unstake_at_different_times() {
     let alice_coin_bal = env.read_token_balance(&alice_coin);
     assert_eq!(alice_col_bal, 1_000_000, "Alice collateral fully returned");
     // epoch [100..200]: 1000 / 2 = ~500
-    assert!(alice_coin_bal >= 499 && alice_coin_bal <= 500,
-            "Alice COIN ~500, got {}", alice_coin_bal);
+    assert!(
+        alice_coin_bal >= 499 && alice_coin_bal <= 500,
+        "Alice COIN ~500, got {}",
+        alice_coin_bal
+    );
 
     // Slot 300: Bob unstakes — earned shared [100..200] + solo [200..300]
     env.set_clock(300);
@@ -2395,8 +3004,11 @@ fn test_two_users_unstake_at_different_times() {
     let bob_coin_bal = env.read_token_balance(&bob_coin);
     assert_eq!(bob_col_bal, 1_000_000, "Bob collateral fully returned");
     // [100..200] shared: ~500, [200..300] solo: ~1000 => ~1500
-    assert!(bob_coin_bal >= 1498 && bob_coin_bal <= 1500,
-            "Bob COIN ~1500, got {}", bob_coin_bal);
+    assert!(
+        bob_coin_bal >= 1498 && bob_coin_bal <= 1500,
+        "Bob COIN ~1500, got {}",
+        bob_coin_bal
+    );
 }
 
 #[test]
@@ -2436,8 +3048,11 @@ fn test_three_users_staggered_entry_and_exit() {
     // Alice: [100..150] solo 50 slots = 600, [150..200] 1/2 50 slots = 300,
     //        [200..250] 1/3 50 slots = 200 => total 1100
     let alice_coin_bal = env.read_token_balance(&alice_coin);
-    assert!(alice_coin_bal >= 1098 && alice_coin_bal <= 1100,
-            "Alice COIN ~1100, got {}", alice_coin_bal);
+    assert!(
+        alice_coin_bal >= 1098 && alice_coin_bal <= 1100,
+        "Alice COIN ~1100, got {}",
+        alice_coin_bal
+    );
 
     // Slot 300: Bob unstakes (Bob+Carol for [250..300])
     env.set_clock(300);
@@ -2446,8 +3061,11 @@ fn test_three_users_staggered_entry_and_exit() {
 
     // Bob: [150..200] 1/2 = 300, [200..250] 1/3 = 200, [250..300] 1/2 = 300 => 800
     let bob_coin_bal = env.read_token_balance(&bob_coin);
-    assert!(bob_coin_bal >= 798 && bob_coin_bal <= 800,
-            "Bob COIN ~800, got {}", bob_coin_bal);
+    assert!(
+        bob_coin_bal >= 798 && bob_coin_bal <= 800,
+        "Bob COIN ~800, got {}",
+        bob_coin_bal
+    );
 
     // Slot 350: Carol unstakes (solo for [300..350])
     env.set_clock(350);
@@ -2456,8 +3074,11 @@ fn test_three_users_staggered_entry_and_exit() {
 
     // Carol: [200..250] 1/3 = 200, [250..300] 1/2 = 300, [300..350] solo = 600 => 1100
     let carol_coin_bal = env.read_token_balance(&carol_coin);
-    assert!(carol_coin_bal >= 1098 && carol_coin_bal <= 1100,
-            "Carol COIN ~1100, got {}", carol_coin_bal);
+    assert!(
+        carol_coin_bal >= 1098 && carol_coin_bal <= 1100,
+        "Carol COIN ~1100, got {}",
+        carol_coin_bal
+    );
 }
 
 #[test]
@@ -2476,7 +3097,7 @@ fn test_partial_unstake_then_full_unstake_different_users() {
 
     env.stake(&alice, 2_000_000); // 2/3 of pool
     env.advance_blockhash();
-    env.stake(&bob, 1_000_000);   // 1/3 of pool
+    env.stake(&bob, 1_000_000); // 1/3 of pool
 
     // Slot 200: Alice partial-unstakes 1M
     env.set_clock(200);
@@ -2485,8 +3106,11 @@ fn test_partial_unstake_then_full_unstake_different_users() {
 
     // [100..200]: Alice 2/3 of 900 = 600
     let alice_coin_1_bal = env.read_token_balance(&alice_coin_1);
-    assert!(alice_coin_1_bal >= 599 && alice_coin_1_bal <= 600,
-            "Alice partial COIN ~600, got {}", alice_coin_1_bal);
+    assert!(
+        alice_coin_1_bal >= 599 && alice_coin_1_bal <= 600,
+        "Alice partial COIN ~600, got {}",
+        alice_coin_1_bal
+    );
 
     // Slot 300: Both withdraw fully (Alice has 1M left, Bob has 1M, pool = 2M)
     env.set_clock(300);
@@ -2498,13 +3122,19 @@ fn test_partial_unstake_then_full_unstake_different_users() {
 
     // [200..300]: pool=2M, each has 1M => each gets 900/2 = 450
     let alice_coin_2_bal = env.read_token_balance(&alice_coin_2);
-    assert!(alice_coin_2_bal >= 449 && alice_coin_2_bal <= 450,
-            "Alice remaining COIN ~450, got {}", alice_coin_2_bal);
+    assert!(
+        alice_coin_2_bal >= 449 && alice_coin_2_bal <= 450,
+        "Alice remaining COIN ~450, got {}",
+        alice_coin_2_bal
+    );
 
     // Bob total: [100..200] 1/3 = 300, [200..300] 1/2 = 450 => 750
     let bob_coin_bal = env.read_token_balance(&bob_coin);
-    assert!(bob_coin_bal >= 749 && bob_coin_bal <= 750,
-            "Bob COIN ~750, got {}", bob_coin_bal);
+    assert!(
+        bob_coin_bal >= 749 && bob_coin_bal <= 750,
+        "Bob COIN ~750, got {}",
+        bob_coin_bal
+    );
 }
 
 #[test]
@@ -2525,7 +3155,11 @@ fn test_claim_then_unstake_no_double_rewards() {
     let claim_ata = env.claim_stake_rewards(&alice);
     let claimed = env.read_token_balance(&claim_ata);
     // Solo for 1 epoch => ~1000
-    assert!(claimed >= 999 && claimed <= 1000, "Claimed ~1000, got {}", claimed);
+    assert!(
+        claimed >= 999 && claimed <= 1000,
+        "Claimed ~1000, got {}",
+        claimed
+    );
 
     // Slot 300: Unstake — should get rewards for [200..300] only, not double
     env.set_clock(300);
@@ -2534,12 +3168,19 @@ fn test_claim_then_unstake_no_double_rewards() {
     assert_eq!(env.read_token_balance(&col_ata), 1_000_000);
     let unstake_coin = env.read_token_balance(&coin_ata);
     // [200..300] solo => ~1000
-    assert!(unstake_coin >= 999 && unstake_coin <= 1000,
-            "Unstake COIN ~1000, got {}", unstake_coin);
+    assert!(
+        unstake_coin >= 999 && unstake_coin <= 1000,
+        "Unstake COIN ~1000, got {}",
+        unstake_coin
+    );
 
     // Total: claimed + unstake_coin should be ~2000 (2 epochs solo)
     let total = claimed + unstake_coin;
-    assert!(total >= 1998 && total <= 2000, "Total COIN ~2000, got {}", total);
+    assert!(
+        total >= 1998 && total <= 2000,
+        "Total COIN ~2000, got {}",
+        total
+    );
 }
 
 #[test]
@@ -2560,10 +3201,8 @@ fn test_user_leaves_mid_epoch_collateral_conserved() {
     env.stake(&bob, 1_000_000);
 
     // Check vault has 3M
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     assert_eq!(env.read_token_balance(&stake_vault), 3_000_000);
 
     // Alice partial unstake 500K
@@ -2609,11 +3248,7 @@ fn try_percolator_admin_ix_2(
 }
 
 /// UpdateAuthority (tag 32) — takes 3 accounts: [current_signer, new_authority, slab]
-fn try_update_admin(
-    env: &mut TestEnv,
-    admin: &Keypair,
-    new_admin: &Pubkey,
-) -> Result<(), String> {
+fn try_update_admin(env: &mut TestEnv, admin: &Keypair, new_admin: &Pubkey) -> Result<(), String> {
     let ix = Instruction {
         program_id: env.percolator_id,
         accounts: vec![
@@ -2704,12 +3339,20 @@ fn test_admin_burn_disables_all_admin_instructions() {
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Verify admin works by updating admin to self (no-op)
     let result = try_update_admin(&mut env, &admin, &admin.pubkey());
-    assert!(result.is_ok(), "Admin should work before burn: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Admin should work before burn: {:?}",
+        result
+    );
 
     // Now burn admin
     env.advance_blockhash();
     let result = try_update_admin(&mut env, &admin, &Pubkey::default());
-    assert!(result.is_ok(), "UpdateAdmin to zero should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "UpdateAdmin to zero should succeed: {:?}",
+        result
+    );
 
     let anyone = Keypair::new();
     env.svm.airdrop(&anyone.pubkey(), 10_000_000_000).unwrap();
@@ -2728,7 +3371,11 @@ fn test_admin_burn_disables_all_admin_instructions() {
     assert!(r.is_err(), "UpdateConfig must fail after admin burn");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_set_oracle_authority(&anyone.pubkey()));
+    let r = try_percolator_admin_ix_2(
+        &mut env,
+        &anyone,
+        encode_set_oracle_authority(&anyone.pubkey()),
+    );
     assert!(r.is_err(), "SetOracleAuthority must fail after admin burn");
 
     env.advance_blockhash();
@@ -2741,7 +3388,10 @@ fn test_admin_burn_disables_all_admin_instructions() {
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_8(&mut env, &anyone, encode_admin_force_close(0));
-    assert!(r.is_err(), "AdminForceCloseAccount must fail after admin burn");
+    assert!(
+        r.is_err(),
+        "AdminForceCloseAccount must fail after admin burn"
+    );
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_2(
@@ -2749,7 +3399,10 @@ fn test_admin_burn_disables_all_admin_instructions() {
         &anyone,
         encode_set_insurance_withdraw_policy(&anyone.pubkey(), 1_000_000, 5000, 100),
     );
-    assert!(r.is_err(), "SetInsuranceWithdrawPolicy must fail after admin burn");
+    assert!(
+        r.is_err(),
+        "SetInsuranceWithdrawPolicy must fail after admin burn"
+    );
 
     env.advance_blockhash();
     let r = try_update_admin(&mut env, &admin, &admin.pubkey());
@@ -2824,19 +3477,18 @@ fn test_no_instruction_to_redirect_user_funds() {
     let vault_before = env.vault_balance();
 
     let attacker = Keypair::new();
-    env.svm
-        .airdrop(&attacker.pubkey(), 10_000_000_000)
-        .unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
     env.set_clock(200);
 
     // Attack 1: attacker tries unstake using depositor's SP PDA
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (depositor_sp, _) = Pubkey::find_program_address(
-        &[b"sp", env.slab.as_ref(), depositor.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", env.slab.as_ref(), depositor.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     let col_mint = env.collateral_mint;
     let attacker_col = env.create_ata(&col_mint, &attacker.pubkey(), 0);
     let attacker_coin = env.create_coin_ata(&attacker.pubkey(), 0);
@@ -2858,12 +3510,23 @@ fn test_no_instruction_to_redirect_user_funds() {
         data: encode_unstake(1_000_000),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&attacker.pubkey()), &[&attacker], env.svm.latest_blockhash());
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Attacker must not unstake depositor's position");
+    assert!(
+        result.is_err(),
+        "Attacker must not unstake depositor's position"
+    );
 
     // Verify vault unchanged — no partial execution
-    assert_eq!(env.vault_balance(), vault_before, "Vault must be unchanged after failed attack");
+    assert_eq!(
+        env.vault_balance(),
+        vault_before,
+        "Vault must be unchanged after failed attack"
+    );
 
     // Attack 2: attacker tries claim using depositor's SP PDA
     env.advance_blockhash();
@@ -2883,13 +3546,28 @@ fn test_no_instruction_to_redirect_user_funds() {
         data: encode_claim_stake_rewards(),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&attacker.pubkey()), &[&attacker], env.svm.latest_blockhash());
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Attacker must not claim depositor's rewards");
+    assert!(
+        result.is_err(),
+        "Attacker must not claim depositor's rewards"
+    );
 
     // Verify attacker received nothing
-    assert_eq!(env.read_token_balance(&attacker_col), 0, "Attacker must get 0 collateral");
-    assert_eq!(env.read_token_balance(&attacker_coin), 0, "Attacker must get 0 COIN");
+    assert_eq!(
+        env.read_token_balance(&attacker_col),
+        0,
+        "Attacker must get 0 collateral"
+    );
+    assert_eq!(
+        env.read_token_balance(&attacker_coin),
+        0,
+        "Attacker must get 0 COIN"
+    );
 
     // Verify depositor's position is intact
     let sp_data = env.svm.get_account(&depositor_sp).unwrap();
@@ -2898,7 +3576,7 @@ fn test_no_instruction_to_redirect_user_funds() {
 }
 
 #[test]
-fn test_insurance_topup_permissionless_withdraw_restricted() {
+fn test_insurance_topup_authority_gated_withdraw_restricted() {
     let mut env = TestEnv::new();
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -2918,7 +3596,6 @@ fn test_insurance_topup_permissionless_withdraw_restricted() {
             AccountMeta::new(donor_ata, false),
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
         ],
         data: encode_topup_insurance(1_000_000),
     };
@@ -2928,9 +3605,14 @@ fn test_insurance_topup_permissionless_withdraw_restricted() {
         &[&donor],
         env.svm.latest_blockhash(),
     );
-    env.svm
-        .send_transaction(tx)
-        .expect("insurance topup should succeed");
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "non-authority insurance topup must be rejected"
+    );
+    assert_eq!(env.percolator_insurance_balance(&env.slab), 0);
+
+    let slab = env.slab;
+    env.topup_percolator_insurance(&slab, 1_000_000);
 
     env.advance_blockhash();
     let r = try_percolator_admin_ix_6(&mut env, &admin, encode_withdraw_insurance());
@@ -2979,7 +3661,11 @@ fn test_e2e_deposit_earn_withdraw() {
     env.claim_stake_rewards_to(&depositor, &coin_ata);
     let reward = env.read_token_balance(&coin_ata);
     // 500 * 2 = ~1000 (sole depositor for 2 epochs)
-    assert!(reward >= 998 && reward <= 1000, "Depositor: ~1000, got {}", reward);
+    assert!(
+        reward >= 998 && reward <= 1000,
+        "Depositor: ~1000, got {}",
+        reward
+    );
 
     // Withdraw collateral
     env.advance_blockhash();
@@ -3012,20 +3698,14 @@ fn test_unauthorized_market_cannot_inflate_shared_coin() {
         .unwrap();
 
     let attacker = Keypair::new();
-    env.svm
-        .airdrop(&attacker.pubkey(), 10_000_000_000)
-        .unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
     let (mrc_pda, _) =
         Pubkey::find_program_address(&[b"mrc", rogue_slab.as_ref()], &env.rewards_id);
-    let (coin_cfg_pda, _) = Pubkey::find_program_address(
-        &[b"coin_cfg", env.coin_mint.as_ref()],
-        &env.rewards_id,
-    );
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", rogue_slab.as_ref()],
-        &env.rewards_id,
-    );
+    let (coin_cfg_pda, _) =
+        Pubkey::find_program_address(&[b"coin_cfg", env.coin_mint.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", rogue_slab.as_ref()], &env.rewards_id);
 
     let ix = Instruction {
         program_id: env.rewards_id,
@@ -3051,7 +3731,10 @@ fn test_unauthorized_market_cannot_inflate_shared_coin() {
         env.svm.latest_blockhash(),
     );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Attacker cannot register market with shared COIN");
+    assert!(
+        result.is_err(),
+        "Attacker cannot register market with shared COIN"
+    );
 }
 
 // ============================================================================
@@ -3067,8 +3750,7 @@ fn test_stake_non_signer_rejected() {
     let user = Keypair::new();
     env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (stake_vault, _) =
         Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
@@ -3116,8 +3798,7 @@ fn test_unstake_non_signer_rejected() {
     env.stake(&user, 500);
     env.set_clock(300);
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (stake_vault, _) =
         Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
@@ -3168,8 +3849,7 @@ fn test_claim_stake_rewards_non_signer_rejected() {
     env.stake(&user, 500);
     env.set_clock(200);
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
         &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
         &env.rewards_id,
@@ -3203,7 +3883,6 @@ fn test_claim_stake_rewards_non_signer_rejected() {
     assert!(result.is_err(), "Claim without signer must fail");
 }
 
-
 // ============================================================================
 // Tests: wrong MRC / slab mismatch
 // ============================================================================
@@ -3232,8 +3911,7 @@ fn test_stake_wrong_slab_mismatch_fails() {
         )
         .unwrap();
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (stake_vault, _) =
         Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     // SP derived from wrong slab — will fail PDA check too
@@ -3284,8 +3962,7 @@ fn test_unstake_wrong_stake_vault_fails() {
     env.stake(&user, 500);
     env.set_clock(300);
 
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
         &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
         &env.rewards_id,
@@ -3296,8 +3973,7 @@ fn test_unstake_wrong_stake_vault_fails() {
 
     // Create a fake vault that is NOT the correct PDA
     let fake_vault = Pubkey::new_unique();
-    let (mrc_key, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_key, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     env.svm
         .set_account(
             fake_vault,
@@ -3380,89 +4056,11 @@ fn test_two_markets_share_one_coin() {
     env.init_coin_config();
     env.init_market_rewards(1000, 100);
 
-    // Create a second percolator market with its own slab
-    let slab2 = Pubkey::new_unique();
-    let vault2 = Pubkey::new_unique();
-    let (vault2_pda, _) =
-        Pubkey::find_program_address(&[b"vault", slab2.as_ref()], &env.percolator_id);
-    env.svm
-        .set_account(
-            slab2,
-            Account {
-                lamports: 1_000_000_000,
-                data: vec![0u8; SLAB_LEN],
-                owner: env.percolator_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-    env.svm
-        .set_account(
-            vault2,
-            Account {
-                lamports: 1_000_000,
-                data: make_token_account_data(&env.collateral_mint, &vault2_pda, 0),
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Init market 2 via percolator
-    let dummy_ata2 = Pubkey::new_unique();
-    env.svm
-        .set_account(
-            dummy_ata2,
-            Account {
-                lamports: 1_000_000,
-                data: vec![0u8; TokenAccount::LEN],
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    let ix = Instruction {
-        program_id: env.percolator_id,
-        accounts: vec![
-            AccountMeta::new(env.payer.pubkey(), true),
-            AccountMeta::new(slab2, false),
-            AccountMeta::new_readonly(env.collateral_mint, false),
-            AccountMeta::new(vault2, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(dummy_ata2, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data: encode_init_market(
-            &env.payer.pubkey(),
-            &env.collateral_mint,
-            &TEST_FEED_ID,
-            0,
-        ),
-    };
-    let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix, ix],
-        Some(&env.payer.pubkey()),
-        &[&env.payer],
-        env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init_market2 failed");
-
-    // Init rewards for market 2 (different N)
-    let (mrc_pda2, _) =
-        Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
+    // Create a second percolator market with its own rewards config.
+    let slab2 = env.init_second_market(2000, 100);
+    let (mrc_pda2, _) = Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
     let (stake_vault2, _) =
         Pubkey::find_program_address(&[b"stake_vault", slab2.as_ref()], &env.rewards_id);
-    env.register_insurance_operator_for_slab(&slab2);
-    env.burn_market_admin_for_slab(&slab2);
-    env.try_init_market_rewards_for_slab(&slab2, 2000, 100)
-        .expect("init_market_rewards2 failed");
 
     // Stake on market 1
     let alice = Keypair::new();
@@ -3501,7 +4099,9 @@ fn test_two_markets_share_one_coin() {
         &[&bob],
         env.svm.latest_blockhash(),
     );
-    env.svm.send_transaction(tx).expect("bob stake market2 failed");
+    env.svm
+        .send_transaction(tx)
+        .expect("bob stake market2 failed");
 
     // Advance 100 slots (1 epoch)
     env.set_clock(200);
@@ -3543,7 +4143,9 @@ fn test_two_markets_share_one_coin() {
         &[&bob],
         env.svm.latest_blockhash(),
     );
-    env.svm.send_transaction(tx).expect("bob claim market2 failed");
+    env.svm
+        .send_transaction(tx)
+        .expect("bob claim market2 failed");
 
     let bob_bal = env.read_token_balance(&bob_coin);
     assert!(
@@ -3599,8 +4201,7 @@ fn test_unstake_wrong_user_sp_rejected() {
     env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
 
     // Bob builds an unstake tx using Alice's SP PDA but his own ATAs
-    let (mrc_pda, _) =
-        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let (stake_vault, _) =
         Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     // Alice's stake position PDA
@@ -3616,14 +4217,14 @@ fn test_unstake_wrong_user_sp_rejected() {
     let ix = Instruction {
         program_id: env.rewards_id,
         accounts: vec![
-            AccountMeta::new(bob.pubkey(), true),             // Bob is the signer
+            AccountMeta::new(bob.pubkey(), true), // Bob is the signer
             AccountMeta::new(mrc_pda, false),
             AccountMeta::new_readonly(env.slab, false),
-            AccountMeta::new(bob_col_ata, false),             // Bob's collateral ATA
+            AccountMeta::new(bob_col_ata, false), // Bob's collateral ATA
             AccountMeta::new(stake_vault, false),
-            AccountMeta::new(alice_sp, false),                // Alice's SP PDA!
+            AccountMeta::new(alice_sp, false), // Alice's SP PDA!
             AccountMeta::new(env.coin_mint, false),
-            AccountMeta::new(bob_coin_ata, false),            // Bob's COIN ATA
+            AccountMeta::new(bob_coin_ata, false), // Bob's COIN ATA
             AccountMeta::new_readonly(env.mint_authority_pda, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
@@ -3663,10 +4264,16 @@ fn test_immediate_withdraw_returns_deposit_zero_rewards() {
     env.advance_blockhash();
     let (col_ata, coin_ata) = env.unstake_and_get_atas(&user, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000,
-               "Full deposit must be returned on immediate withdraw");
-    assert_eq!(env.read_token_balance(&coin_ata), 0,
-               "Zero COIN for zero elapsed time");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "Full deposit must be returned on immediate withdraw"
+    );
+    assert_eq!(
+        env.read_token_balance(&coin_ata),
+        0,
+        "Zero COIN for zero elapsed time"
+    );
 }
 
 #[test]
@@ -3686,12 +4293,18 @@ fn test_early_withdraw_proportional_rewards() {
     env.set_clock(125);
     let (col_ata, coin_ata) = env.unstake_and_get_atas(&user, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000,
-               "Full deposit returned");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "Full deposit returned"
+    );
     // 1000 * 25/100 = 250 COIN
     let coin_bal = env.read_token_balance(&coin_ata);
-    assert!(coin_bal >= 249 && coin_bal <= 250,
-            "25 slots should earn ~250 COIN, got {}", coin_bal);
+    assert!(
+        coin_bal >= 249 && coin_bal <= 250,
+        "25 slots should earn ~250 COIN, got {}",
+        coin_bal
+    );
 }
 
 #[test]
@@ -3711,12 +4324,18 @@ fn test_late_withdraw_accumulates_all_rewards() {
     env.set_clock(1100);
     let (col_ata, coin_ata) = env.unstake_and_get_atas(&user, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000,
-               "Full deposit returned after 10 epochs");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "Full deposit returned after 10 epochs"
+    );
     let coin_bal = env.read_token_balance(&coin_ata);
     // 1000 * 10 = 10000 COIN
-    assert!(coin_bal >= 9998 && coin_bal <= 10000,
-            "10 epochs solo should earn ~10000 COIN, got {}", coin_bal);
+    assert!(
+        coin_bal >= 9998 && coin_bal <= 10000,
+        "10 epochs solo should earn ~10000 COIN, got {}",
+        coin_bal
+    );
 }
 
 #[test]
@@ -3738,7 +4357,11 @@ fn test_withdraw_redeposit_withdraw_cycle() {
     let (col_a, coin_a) = env.unstake_and_get_atas(&alice, 1_000_000);
     assert_eq!(env.read_token_balance(&col_a), 1_000_000);
     let alice_coin = env.read_token_balance(&coin_a);
-    assert!(alice_coin >= 999 && alice_coin <= 1000, "Alice: ~1000, got {}", alice_coin);
+    assert!(
+        alice_coin >= 999 && alice_coin <= 1000,
+        "Alice: ~1000, got {}",
+        alice_coin
+    );
 
     // Bob: deposit at 300, withdraw at 500 (2 epochs solo)
     env.set_clock(300);
@@ -3748,11 +4371,19 @@ fn test_withdraw_redeposit_withdraw_cycle() {
     assert_eq!(env.read_token_balance(&col_b), 1_000_000);
     let bob_coin = env.read_token_balance(&coin_b);
     // 1000 * 2 = 2000 COIN for 2 epochs
-    assert!(bob_coin >= 1998 && bob_coin <= 2000, "Bob: ~2000, got {}", bob_coin);
+    assert!(
+        bob_coin >= 1998 && bob_coin <= 2000,
+        "Bob: ~2000, got {}",
+        bob_coin
+    );
 
     // Each cycle independent — total matches expected
     let total = alice_coin + bob_coin;
-    assert!(total >= 2997 && total <= 3000, "Total: ~3000, got {}", total);
+    assert!(
+        total >= 2997 && total <= 3000,
+        "Total: ~3000, got {}",
+        total
+    );
 }
 
 #[test]
@@ -3779,8 +4410,11 @@ fn test_adversarial_flash_deposit_no_extra_rewards() {
 
     // Bob gets deposit back but 0 COIN (deposited and withdrew in same slot)
     assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
-    assert_eq!(env.read_token_balance(&bob_coin), 0,
-               "Flash deposit must earn zero COIN");
+    assert_eq!(
+        env.read_token_balance(&bob_coin),
+        0,
+        "Flash deposit must earn zero COIN"
+    );
 
     // Alice continues earning solo for full 2 epochs
     env.set_clock(300);
@@ -3789,8 +4423,11 @@ fn test_adversarial_flash_deposit_no_extra_rewards() {
     // Slots [100..150]: solo = 500, [150..300]: solo = 1500. Total = 2000
     // Bob's flash deposit at slot 150 settled Alice's pending but didn't dilute
     // because bob deposited and withdrew at same slot (total_staked returned to 1M)
-    assert!(alice_bal >= 1998 && alice_bal <= 2000,
-            "Alice should get ~2000 COIN unaffected by flash deposit, got {}", alice_bal);
+    assert!(
+        alice_bal >= 1998 && alice_bal <= 2000,
+        "Alice should get ~2000 COIN unaffected by flash deposit, got {}",
+        alice_bal
+    );
 }
 
 #[test]
@@ -3822,8 +4459,11 @@ fn test_multi_user_early_late_exit_reward_conservation() {
     let (alice_col, alice_coin) = env.unstake_and_get_atas(&alice, 1_000_000);
     assert_eq!(env.read_token_balance(&alice_col), 1_000_000);
     let alice_reward = env.read_token_balance(&alice_coin);
-    assert!(alice_reward >= 199 && alice_reward <= 200,
-            "Alice (early exit): ~200, got {}", alice_reward);
+    assert!(
+        alice_reward >= 199 && alice_reward <= 200,
+        "Alice (early exit): ~200, got {}",
+        alice_reward
+    );
 
     // Bob withdraws at slot 200 (1 epoch total)
     // [100..150]: 1/3 of 1200*50/100 = 200
@@ -3833,8 +4473,11 @@ fn test_multi_user_early_late_exit_reward_conservation() {
     let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
     assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
     let bob_reward = env.read_token_balance(&bob_coin);
-    assert!(bob_reward >= 499 && bob_reward <= 500,
-            "Bob (mid exit): ~500, got {}", bob_reward);
+    assert!(
+        bob_reward >= 499 && bob_reward <= 500,
+        "Bob (mid exit): ~500, got {}",
+        bob_reward
+    );
 
     // Carol withdraws LATE at slot 400 (3 epochs total)
     // [100..150]: 1/3 = 200
@@ -3845,15 +4488,21 @@ fn test_multi_user_early_late_exit_reward_conservation() {
     let (carol_col, carol_coin) = env.unstake_and_get_atas(&carol, 1_000_000);
     assert_eq!(env.read_token_balance(&carol_col), 1_000_000);
     let carol_reward = env.read_token_balance(&carol_coin);
-    assert!(carol_reward >= 2898 && carol_reward <= 2900,
-            "Carol (late exit): ~2900, got {}", carol_reward);
+    assert!(
+        carol_reward >= 2898 && carol_reward <= 2900,
+        "Carol (late exit): ~2900, got {}",
+        carol_reward
+    );
 
     // Conservation check: total COIN emitted should match expected.
     // Slots with depositors: [100..400] = 300 slots
     // Total expected = 1200 * 300 / 100 = 3600
     let total = alice_reward + bob_reward + carol_reward;
-    assert!(total >= 3597 && total <= 3600,
-            "Total COIN must be conserved: expected ~3600, got {}", total);
+    assert!(
+        total >= 3597 && total <= 3600,
+        "Total COIN must be conserved: expected ~3600, got {}",
+        total
+    );
 }
 
 #[test]
@@ -3886,8 +4535,11 @@ fn test_adversarial_withdraw_during_zero_total_staked() {
     assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
     let bob_reward = env.read_token_balance(&bob_coin);
     // Bob earns only for [500..600] = 1000 COIN, NOT for the gap period
-    assert!(bob_reward >= 999 && bob_reward <= 1000,
-            "Bob must earn only for active period, got {}", bob_reward);
+    assert!(
+        bob_reward >= 999 && bob_reward <= 1000,
+        "Bob must earn only for active period, got {}",
+        bob_reward
+    );
 }
 
 // ============================================================================
@@ -3909,7 +4561,10 @@ fn test_draw_depositor_capital_rejected() {
     let col_mint = env.collateral_mint;
     let dao_dest = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 0);
     let result = env.try_draw_insurance(1, &dao_dest);
-    assert!(result.is_err(), "DAO must not draw depositor capital (profit = 0)");
+    assert!(
+        result.is_err(),
+        "DAO must not draw depositor capital (profit = 0)"
+    );
     assert_eq!(env.vault_balance(), 1_000_000, "Vault untouched");
 }
 
@@ -3926,17 +4581,25 @@ fn test_draw_only_profits() {
     // vault = 1M, total_staked = 1M
 
     // Inject 500K "profit" by sending tokens directly to vault
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let donor_ata = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 500_000);
     let xfer_ix = spl_token::instruction::transfer(
-        &spl_token::ID, &donor_ata, &stake_vault,
-        &env.dao_authority.pubkey(), &[], 500_000,
-    ).unwrap();
+        &spl_token::ID,
+        &donor_ata,
+        &stake_vault,
+        &env.dao_authority.pubkey(),
+        &[],
+        500_000,
+    )
+    .unwrap();
     let tx = Transaction::new_signed_with_payer(
-        &[xfer_ix], Some(&env.dao_authority.pubkey()),
-        &[&env.dao_authority], env.svm.latest_blockhash());
+        &[xfer_ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
     env.svm.send_transaction(tx).expect("inject profit");
     assert_eq!(env.vault_balance(), 1_500_000); // 1M deposit + 500K profit
 
@@ -3954,7 +4617,11 @@ fn test_draw_only_profits() {
     // User still gets full deposit back
     env.set_clock(200);
     let (col_ata, _) = env.unstake_and_get_atas(&user, 1_000_000);
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000, "Full deposit returned");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "Full deposit returned"
+    );
 }
 
 #[test]
@@ -3969,17 +4636,25 @@ fn test_draw_all_remaining_after_depositors_withdraw() {
     env.stake(&user, 1_000_000);
 
     // Inject 300K profit
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let donor_ata = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 300_000);
     let xfer_ix = spl_token::instruction::transfer(
-        &spl_token::ID, &donor_ata, &stake_vault,
-        &env.dao_authority.pubkey(), &[], 300_000,
-    ).unwrap();
+        &spl_token::ID,
+        &donor_ata,
+        &stake_vault,
+        &env.dao_authority.pubkey(),
+        &[],
+        300_000,
+    )
+    .unwrap();
     let tx = Transaction::new_signed_with_payer(
-        &[xfer_ix], Some(&env.dao_authority.pubkey()),
-        &[&env.dao_authority], env.svm.latest_blockhash());
+        &[xfer_ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
     env.svm.send_transaction(tx).expect("inject profit");
 
     // User withdraws — gets full deposit
@@ -4015,17 +4690,25 @@ fn test_depositors_always_get_full_deposit_back() {
     // vault = 3M, total_staked = 3M
 
     // Inject 1M profit
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let donor_ata = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 1_000_000);
     let xfer_ix = spl_token::instruction::transfer(
-        &spl_token::ID, &donor_ata, &stake_vault,
-        &env.dao_authority.pubkey(), &[], 1_000_000,
-    ).unwrap();
+        &spl_token::ID,
+        &donor_ata,
+        &stake_vault,
+        &env.dao_authority.pubkey(),
+        &[],
+        1_000_000,
+    )
+    .unwrap();
     let tx = Transaction::new_signed_with_payer(
-        &[xfer_ix], Some(&env.dao_authority.pubkey()),
-        &[&env.dao_authority], env.svm.latest_blockhash());
+        &[xfer_ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
     env.svm.send_transaction(tx).expect("inject profit");
     // vault = 4M, total_staked = 3M, profit = 1M
 
@@ -4039,7 +4722,11 @@ fn test_depositors_always_get_full_deposit_back() {
     let (alice_col, _) = env.unstake_and_get_atas(&alice, 2_000_000);
     let (bob_col, _) = env.unstake_and_get_atas(&bob, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&alice_col), 2_000_000, "Alice: full 2M");
+    assert_eq!(
+        env.read_token_balance(&alice_col),
+        2_000_000,
+        "Alice: full 2M"
+    );
     assert_eq!(env.read_token_balance(&bob_col), 1_000_000, "Bob: full 1M");
     assert_eq!(env.vault_balance(), 0);
 }
@@ -4060,8 +4747,39 @@ fn test_draw_insurance_non_governance_rejected() {
     let attacker_dest = env.create_ata(&col_mint, &attacker.pubkey(), 0);
 
     let result = env.try_draw_insurance_direct(&attacker, 1, &attacker_dest);
-    assert!(result.is_err(), "Non-governance must be rejected for draw_insurance");
+    assert!(
+        result.is_err(),
+        "Non-governance must be rejected for draw_insurance"
+    );
     assert_eq!(env.vault_balance(), 1_000_000, "Vault must be untouched");
+}
+
+#[test]
+fn test_governance_adapter_rejects_wrong_controller_draw() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 1_000_000);
+    let slab = env.slab;
+    env.inject_profit(&slab, 300_000);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let col_mint = env.collateral_mint;
+    let attacker_dest = env.create_ata(&col_mint, &attacker.pubkey(), 0);
+    let before_vault = env.vault_balance();
+    let before_attacker = env.read_token_balance(&attacker_dest);
+
+    let result = env.try_draw_insurance_with_signer(&attacker, 300_000, &attacker_dest);
+    assert!(
+        result.is_err(),
+        "non-controller must not drive governance adapter profit draws"
+    );
+    assert_eq!(env.vault_balance(), before_vault);
+    assert_eq!(env.read_token_balance(&attacker_dest), before_attacker);
 }
 
 #[test]
@@ -4097,26 +4815,38 @@ fn test_adversarial_direct_vault_transfer_no_steal() {
     env.stake(&user, 1_000_000);
 
     // Attacker sends 500K directly to vault
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let attacker = Keypair::new();
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
     let attacker_ata = env.create_ata(&col_mint, &attacker.pubkey(), 500_000);
     let xfer_ix = spl_token::instruction::transfer(
-        &spl_token::ID, &attacker_ata, &stake_vault,
-        &attacker.pubkey(), &[], 500_000,
-    ).unwrap();
+        &spl_token::ID,
+        &attacker_ata,
+        &stake_vault,
+        &attacker.pubkey(),
+        &[],
+        500_000,
+    )
+    .unwrap();
     let tx = Transaction::new_signed_with_payer(
-        &[xfer_ix], Some(&attacker.pubkey()),
-        &[&attacker], env.svm.latest_blockhash());
+        &[xfer_ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
     env.svm.send_transaction(tx).expect("direct transfer");
     assert_eq!(env.vault_balance(), 1_500_000);
 
     // User withdraws — gets exactly their deposit (not the attacker's tokens)
     env.set_clock(200);
     let (col_ata, _) = env.unstake_and_get_atas(&user, 1_000_000);
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000, "User gets exact deposit");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "User gets exact deposit"
+    );
 
     // Attacker's tokens stuck as profit — DAO can draw them
     assert_eq!(env.vault_balance(), 500_000);
@@ -4147,7 +4877,11 @@ fn test_adversarial_1_token_dilution_negligible() {
     let whale_coin = env.claim_stake_rewards(&whale);
     let whale_bal = env.read_token_balance(&whale_coin);
     // Whale has 1M / 1M+1 ≈ 99.9999% of pool. Should get ~999 COIN.
-    assert!(whale_bal >= 998, "1-token dilution must be negligible, got {}", whale_bal);
+    assert!(
+        whale_bal >= 998,
+        "1-token dilution must be negligible, got {}",
+        whale_bal
+    );
 }
 
 #[test]
@@ -4169,7 +4903,10 @@ fn test_adversarial_withdraw_1_repeatedly_no_rounding_exploit() {
         env.advance_blockhash();
     }
     // Must get back exactly 100 (no rounding exploitation)
-    assert_eq!(total_withdrawn, 100, "Repeated 1-token withdrawals must total exact deposit");
+    assert_eq!(
+        total_withdrawn, 100,
+        "Repeated 1-token withdrawals must total exact deposit"
+    );
     assert_eq!(env.vault_balance(), 0);
 }
 
@@ -4190,9 +4927,21 @@ fn test_adversarial_same_slot_triple_op() {
     env.advance_blockhash();
     let (col_ata, coin_ata) = env.unstake_and_get_atas(&user, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&claim_ata), 0, "Claim in same slot = 0");
-    assert_eq!(env.read_token_balance(&col_ata), 1_000_000, "Full deposit back");
-    assert_eq!(env.read_token_balance(&coin_ata), 0, "Unstake in same slot = 0 COIN");
+    assert_eq!(
+        env.read_token_balance(&claim_ata),
+        0,
+        "Claim in same slot = 0"
+    );
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        1_000_000,
+        "Full deposit back"
+    );
+    assert_eq!(
+        env.read_token_balance(&coin_ata),
+        0,
+        "Unstake in same slot = 0 COIN"
+    );
 }
 
 #[test]
@@ -4216,7 +4965,11 @@ fn test_adversarial_claim_then_unstake_no_double_rewards() {
 
     // Total = claimed + unstaked_coin should be ~2000 (2 epochs solo)
     let total = claimed + unstaked_coin;
-    assert!(total >= 1998 && total <= 2000, "Total ~2000, no double count, got {}", total);
+    assert!(
+        total >= 1998 && total <= 2000,
+        "Total ~2000, no double count, got {}",
+        total
+    );
 }
 
 #[test]
@@ -4235,18 +4988,25 @@ fn test_adversarial_fake_mrc_rejected() {
     fake_data[..8].copy_from_slice(b"MRC_V003");
     // Put slab key in the right spot
     fake_data[8..40].copy_from_slice(env.slab.as_ref());
-    env.svm.set_account(fake_mrc, Account {
-        lamports: 1_000_000,
-        data: fake_data,
-        owner: env.rewards_id,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            fake_mrc,
+            Account {
+                lamports: 1_000_000,
+                data: fake_data,
+                owner: env.rewards_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (sp_pda, _) = Pubkey::find_program_address(
-        &[b"sp", env.slab.as_ref(), attacker.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", env.slab.as_ref(), attacker.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     let col_mint = env.collateral_mint;
     let attacker_ata = env.create_ata(&col_mint, &attacker.pubkey(), 500);
 
@@ -4266,7 +5026,11 @@ fn test_adversarial_fake_mrc_rejected() {
         data: encode_stake(500),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&attacker.pubkey()), &[&attacker], env.svm.latest_blockhash());
+        &[ix],
+        Some(&attacker.pubkey()),
+        &[&attacker],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Fake MRC must be rejected (PDA mismatch)");
 }
@@ -4285,12 +5049,13 @@ fn test_adversarial_steal_via_wrong_sp_pda() {
     env.stake(&alice, 1_000_000);
 
     env.set_clock(200);
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let (alice_sp, _) = Pubkey::find_program_address(
-        &[b"sp", env.slab.as_ref(), alice.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", env.slab.as_ref(), alice.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     let col_mint = env.collateral_mint;
     let bob_col = env.create_ata(&col_mint, &bob.pubkey(), 0);
     let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
@@ -4313,7 +5078,11 @@ fn test_adversarial_steal_via_wrong_sp_pda() {
         data: encode_unstake(1_000_000),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&bob.pubkey()), &[&bob], env.svm.latest_blockhash());
+        &[ix],
+        Some(&bob.pubkey()),
+        &[&bob],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Must not steal via wrong SP PDA");
     assert_eq!(env.vault_balance(), 1_000_000, "Alice's deposit safe");
@@ -4338,17 +5107,25 @@ fn test_depositor_capital_protected_after_profit_draw() {
     // vault = 3M, total_staked = 3M
 
     // Inject 600K profit
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let donor_ata = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 600_000);
     let xfer_ix = spl_token::instruction::transfer(
-        &spl_token::ID, &donor_ata, &stake_vault,
-        &env.dao_authority.pubkey(), &[], 600_000,
-    ).unwrap();
+        &spl_token::ID,
+        &donor_ata,
+        &stake_vault,
+        &env.dao_authority.pubkey(),
+        &[],
+        600_000,
+    )
+    .unwrap();
     let tx = Transaction::new_signed_with_payer(
-        &[xfer_ix], Some(&env.dao_authority.pubkey()),
-        &[&env.dao_authority], env.svm.latest_blockhash());
+        &[xfer_ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
     env.svm.send_transaction(tx).expect("inject profit");
     // vault = 3.6M, total_staked = 3M, profit = 600K
 
@@ -4418,13 +5195,18 @@ fn test_init_coin_config_non_spl_mint_rejected() {
     );
     // Craft a fake mint: correct format but owned by a random program
     let fake_owner = Pubkey::new_unique();
-    env.svm.set_account(fake_mint, Account {
-        lamports: 1_000_000,
-        data: make_mint_data_with_authority(&fake_mint_auth),
-        owner: fake_owner, // NOT spl_token::ID
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            fake_mint,
+            Account {
+                lamports: 1_000_000,
+                data: make_mint_data_with_authority(&fake_mint_auth),
+                owner: fake_owner, // NOT spl_token::ID
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     let result = env.try_init_coin_config_with_mint(&fake_mint);
     assert!(result.is_err(), "Non-SPL-owned mint must be rejected");
@@ -4456,21 +5238,28 @@ fn test_proportional_withdrawal_defense_in_depth() {
 
     // Directly reduce vault balance to 1M (bypassing draw_insurance constraint)
     // to exercise the proportional withdrawal code path.
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_acct = env.svm.get_account(&stake_vault).unwrap();
-    let vault_token = TokenAccount::unpack(&vault_acct.data).unwrap();
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    assert_eq!(
+        TokenAccount::unpack(&vault_acct.data).unwrap().amount,
+        2_000_000
+    );
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     // Rebuild the token account data with 1M instead of 2M
     let reduced_data = make_token_account_data(&env.collateral_mint, &mrc_pda, 1_000_000);
-    env.svm.set_account(stake_vault, Account {
-        lamports: vault_acct.lamports,
-        data: reduced_data,
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            stake_vault,
+            Account {
+                lamports: vault_acct.lamports,
+                data: reduced_data,
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     assert_eq!(env.vault_balance(), 1_000_000);
     // Now: vault = 1M, total_staked = 2M → ratio = 50%
 
@@ -4478,14 +5267,20 @@ fn test_proportional_withdrawal_defense_in_depth() {
 
     // Alice withdraws: should get 1M * 1M/2M = 500K (proportional)
     let (alice_col, _) = env.unstake_and_get_atas(&alice, 1_000_000);
-    assert_eq!(env.read_token_balance(&alice_col), 500_000,
-               "Proportional withdrawal must give 50% when vault is 50% funded");
+    assert_eq!(
+        env.read_token_balance(&alice_col),
+        500_000,
+        "Proportional withdrawal must give 50% when vault is 50% funded"
+    );
 
     // After Alice: vault = 500K, total_staked = 1M
     // Bob withdraws: should get 1M * 500K/1M = 500K
     let (bob_col, _) = env.unstake_and_get_atas(&bob, 1_000_000);
-    assert_eq!(env.read_token_balance(&bob_col), 500_000,
-               "Bob gets same haircut rate as Alice");
+    assert_eq!(
+        env.read_token_balance(&bob_col),
+        500_000,
+        "Bob gets same haircut rate as Alice"
+    );
     assert_eq!(env.vault_balance(), 0);
 }
 
@@ -4504,22 +5299,26 @@ fn test_proportional_withdrawal_unequal_positions_defense_in_depth() {
 
     env.stake(&alice, 3_000_000); // 75% of pool
     env.advance_blockhash();
-    env.stake(&bob, 1_000_000);   // 25% of pool
-    // vault = 4M, total_staked = 4M
+    env.stake(&bob, 1_000_000); // 25% of pool
+                                // vault = 4M, total_staked = 4M
 
     // Directly set vault to 3M (75% funded)
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_acct = env.svm.get_account(&stake_vault).unwrap();
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    env.svm.set_account(stake_vault, Account {
-        lamports: vault_acct.lamports,
-        data: make_token_account_data(&env.collateral_mint, &mrc_pda, 3_000_000),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    env.svm
+        .set_account(
+            stake_vault,
+            Account {
+                lamports: vault_acct.lamports,
+                data: make_token_account_data(&env.collateral_mint, &mrc_pda, 3_000_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     env.set_clock(200);
 
@@ -4548,18 +5347,22 @@ fn test_proportional_partial_withdrawal_defense_in_depth() {
     env.stake(&user, 1_000_000);
 
     // Set vault to 600K (60% funded)
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_acct = env.svm.get_account(&stake_vault).unwrap();
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    env.svm.set_account(stake_vault, Account {
-        lamports: vault_acct.lamports,
-        data: make_token_account_data(&env.collateral_mint, &mrc_pda, 600_000),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    env.svm
+        .set_account(
+            stake_vault,
+            Account {
+                lamports: vault_acct.lamports,
+                data: make_token_account_data(&env.collateral_mint, &mrc_pda, 600_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     env.set_clock(200);
 
@@ -4592,22 +5395,30 @@ fn test_proportional_full_drain_defense_in_depth() {
     env.stake(&user, 1_000_000);
 
     // Vault set to 0
-    let (stake_vault, _) = Pubkey::find_program_address(
-        &[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
     let vault_acct = env.svm.get_account(&stake_vault).unwrap();
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
-    env.svm.set_account(stake_vault, Account {
-        lamports: vault_acct.lamports,
-        data: make_token_account_data(&env.collateral_mint, &mrc_pda, 0),
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    env.svm
+        .set_account(
+            stake_vault,
+            Account {
+                lamports: vault_acct.lamports,
+                data: make_token_account_data(&env.collateral_mint, &mrc_pda, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     env.set_clock(200);
     let (col_ata, coin_ata) = env.unstake_and_get_atas(&user, 1_000_000);
-    assert_eq!(env.read_token_balance(&col_ata), 0, "0 collateral from empty vault");
+    assert_eq!(
+        env.read_token_balance(&col_ata),
+        0,
+        "0 collateral from empty vault"
+    );
     // COIN rewards still minted
     let coin_bal = env.read_token_balance(&coin_ata);
     assert!(coin_bal >= 999 && coin_bal <= 1000, "COIN must still mint");
@@ -4641,7 +5452,11 @@ fn test_isolation_draw_from_market_a_does_not_touch_market_b() {
     // Inject 500K profit into MARKET 1 ONLY
     env.inject_profit(&slab1, 500_000);
     assert_eq!(env.vault_balance_for(&slab1), 1_500_000);
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2 untouched by injection");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2 untouched by injection"
+    );
 
     // DAO draws 500K profit from market 1
     let col_mint = env.collateral_mint;
@@ -4649,9 +5464,21 @@ fn test_isolation_draw_from_market_a_does_not_touch_market_b() {
     env.draw_insurance_from(&slab1, 500_000, &dao_dest);
 
     // CRITICAL ASSERTIONS: Market 2 vault balance must be exactly unchanged
-    assert_eq!(env.vault_balance_for(&slab1), 1_000_000, "Market 1 reduced by draw");
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2 vault must be untouched");
-    assert_eq!(env.read_token_balance(&dao_dest), 500_000, "DAO received exactly 500K");
+    assert_eq!(
+        env.vault_balance_for(&slab1),
+        1_000_000,
+        "Market 1 reduced by draw"
+    );
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2 vault must be untouched"
+    );
+    assert_eq!(
+        env.read_token_balance(&dao_dest),
+        500_000,
+        "DAO received exactly 500K"
+    );
 
     // Both depositors get their full deposit back
     env.set_clock(200);
@@ -4690,7 +5517,11 @@ fn test_isolation_dao_cannot_draw_from_market_b_via_market_a_profit() {
     // DAO tries to draw from market 2 (which has 0 profit). Must fail.
     let result = env.try_draw_insurance_from(&slab2, 1, &dao_dest);
     assert!(result.is_err(), "Cannot draw from market 2 (no profit)");
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2 vault untouched");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2 vault untouched"
+    );
 
     // DAO can still draw from market 1 (it has profit).
     env.draw_insurance_from(&slab1, 500_000, &dao_dest);
@@ -4718,12 +5549,11 @@ fn test_isolation_cross_market_attack_wrong_mrc_with_other_vault() {
     env.inject_profit(&slab1, 500_000); // only market 1 has profit
 
     // Build a malicious draw: market 1's MRC + slab + coin_cfg, but market 2's vault
-    let (mrc_pda1, _) = Pubkey::find_program_address(
-        &[b"mrc", slab1.as_ref()], &env.rewards_id);
-    let (coin_cfg_pda, _) = Pubkey::find_program_address(
-        &[b"coin_cfg", env.coin_mint.as_ref()], &env.rewards_id);
-    let (vault2, _) = Pubkey::find_program_address(
-        &[b"stake_vault", slab2.as_ref()], &env.rewards_id);
+    let (mrc_pda1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (coin_cfg_pda, _) =
+        Pubkey::find_program_address(&[b"coin_cfg", env.coin_mint.as_ref()], &env.rewards_id);
+    let (vault2, _) =
+        Pubkey::find_program_address(&[b"stake_vault", slab2.as_ref()], &env.rewards_id);
     let col_mint = env.collateral_mint;
     let dao_dest = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 0);
 
@@ -4747,10 +5577,16 @@ fn test_isolation_cross_market_attack_wrong_mrc_with_other_vault() {
         data,
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&env.dao_authority.pubkey()),
-        &[&env.dao_authority], env.svm.latest_blockhash());
+        &[ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Cross-market vault substitution must be rejected");
+    assert!(
+        result.is_err(),
+        "Cross-market vault substitution must be rejected"
+    );
 
     // Both vaults must be unchanged
     assert_eq!(env.vault_balance_for(&slab1), 1_500_000);
@@ -4776,9 +5612,13 @@ fn test_isolation_alice_two_market_positions_independent() {
 
     // Verify both positions exist independently
     let (sp1, _) = Pubkey::find_program_address(
-        &[b"sp", slab1.as_ref(), alice.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", slab1.as_ref(), alice.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     let (sp2, _) = Pubkey::find_program_address(
-        &[b"sp", slab2.as_ref(), alice.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", slab2.as_ref(), alice.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     assert_ne!(sp1, sp2, "Alice has two distinct SP PDAs (one per market)");
 
     let sp1_data = env.svm.get_account(&sp1).unwrap();
@@ -4796,8 +5636,15 @@ fn test_isolation_alice_two_market_positions_independent() {
     // Verify market 2 position is untouched
     let sp2_after = env.svm.get_account(&sp2).unwrap();
     let amt2_after = u64::from_le_bytes(sp2_after.data[8..16].try_into().unwrap());
-    assert_eq!(amt2_after, 2_000_000, "Market 2 position untouched by market 1 withdraw");
-    assert_eq!(env.vault_balance_for(&slab2), 2_000_000, "Market 2 vault untouched");
+    assert_eq!(
+        amt2_after, 2_000_000,
+        "Market 2 position untouched by market 1 withdraw"
+    );
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        2_000_000,
+        "Market 2 vault untouched"
+    );
 
     // Alice withdraws fully from market 2
     let (alice_col2, _) = env.unstake_in_get_atas(&slab2, &alice, 2_000_000);
@@ -4823,30 +5670,46 @@ fn test_isolation_market_a_drained_does_not_haircut_market_b() {
     env.stake_in(&slab2, &bob, 1_000_000);
 
     // Directly drain market 1's vault (simulating defense-in-depth scenario)
-    let (vault1, _) = Pubkey::find_program_address(
-        &[b"stake_vault", slab1.as_ref()], &env.rewards_id);
-    let (mrc_pda1, _) = Pubkey::find_program_address(
-        &[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (vault1, _) =
+        Pubkey::find_program_address(&[b"stake_vault", slab1.as_ref()], &env.rewards_id);
+    let (mrc_pda1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
     let vault1_acct = env.svm.get_account(&vault1).unwrap();
-    env.svm.set_account(vault1, Account {
-        lamports: vault1_acct.lamports,
-        data: make_token_account_data(&env.collateral_mint, &mrc_pda1, 500_000), // 50% drained
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
+    env.svm
+        .set_account(
+            vault1,
+            Account {
+                lamports: vault1_acct.lamports,
+                data: make_token_account_data(&env.collateral_mint, &mrc_pda1, 500_000), // 50% drained
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     assert_eq!(env.vault_balance_for(&slab1), 500_000);
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2 untouched by manipulation");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2 untouched by manipulation"
+    );
 
     // Alice gets 50% (proportional defense-in-depth in market 1)
     env.set_clock(200);
     let (alice_col, _) = env.unstake_in_get_atas(&slab1, &alice, 1_000_000);
-    assert_eq!(env.read_token_balance(&alice_col), 500_000, "Alice: 50% of drained vault 1");
+    assert_eq!(
+        env.read_token_balance(&alice_col),
+        500_000,
+        "Alice: 50% of drained vault 1"
+    );
 
     // Bob gets 100% — market 2 is unaffected
     let (bob_col, _) = env.unstake_in_get_atas(&slab2, &bob, 1_000_000);
-    assert_eq!(env.read_token_balance(&bob_col), 1_000_000, "Bob: 100% — market 2 isolated");
+    assert_eq!(
+        env.read_token_balance(&bob_col),
+        1_000_000,
+        "Bob: 100% — market 2 isolated"
+    );
 }
 
 #[test]
@@ -4874,7 +5737,10 @@ fn test_isolation_per_market_profit_calculation() {
 
     // Try to draw 1M from market 2 — must fail (market 2 has no profit, regardless of market 1)
     let result = env.try_draw_insurance_from(&slab2, 1_000_000, &dao_dest);
-    assert!(result.is_err(), "Market 2 has 0 profit; cannot draw using market 1's surplus");
+    assert!(
+        result.is_err(),
+        "Market 2 has 0 profit; cannot draw using market 1's surplus"
+    );
 
     // Try to draw 1 token from market 2 — must also fail
     let result = env.try_draw_insurance_from(&slab2, 1, &dao_dest);
@@ -4888,7 +5754,11 @@ fn test_isolation_per_market_profit_calculation() {
     assert!(result.is_err(), "Market 1 profit exhausted");
 
     assert_eq!(env.read_token_balance(&dao_dest), 1_000_000);
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2 vault untouched");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2 vault untouched"
+    );
 }
 
 #[test]
@@ -4910,12 +5780,13 @@ fn test_isolation_unstake_wrong_market_vault_rejected() {
     env.stake_in(&slab2, &bob, 1_000_000);
 
     // Alice tries to unstake from market 1 but with market 2's vault
-    let (mrc_pda1, _) = Pubkey::find_program_address(
-        &[b"mrc", slab1.as_ref()], &env.rewards_id);
-    let (vault2, _) = Pubkey::find_program_address(
-        &[b"stake_vault", slab2.as_ref()], &env.rewards_id);
+    let (mrc_pda1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (vault2, _) =
+        Pubkey::find_program_address(&[b"stake_vault", slab2.as_ref()], &env.rewards_id);
     let (sp1, _) = Pubkey::find_program_address(
-        &[b"sp", slab1.as_ref(), alice.pubkey().as_ref()], &env.rewards_id);
+        &[b"sp", slab1.as_ref(), alice.pubkey().as_ref()],
+        &env.rewards_id,
+    );
     let col_mint = env.collateral_mint;
     let alice_col = env.create_ata(&col_mint, &alice.pubkey(), 0);
     let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
@@ -4939,15 +5810,25 @@ fn test_isolation_unstake_wrong_market_vault_rejected() {
         data: encode_unstake(1_000_000),
     };
     let tx = Transaction::new_signed_with_payer(
-        &[ix], Some(&alice.pubkey()),
-        &[&alice], env.svm.latest_blockhash());
+        &[ix],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
-    assert!(result.is_err(), "Cross-market vault substitution must be rejected");
+    assert!(
+        result.is_err(),
+        "Cross-market vault substitution must be rejected"
+    );
 
     // Vaults unchanged
     assert_eq!(env.vault_balance_for(&slab1), 1_000_000);
     assert_eq!(env.vault_balance_for(&slab2), 1_000_000);
-    assert_eq!(env.read_token_balance(&alice_col), 0, "Alice received nothing");
+    assert_eq!(
+        env.read_token_balance(&alice_col),
+        0,
+        "Alice received nothing"
+    );
 }
 
 #[test]
@@ -4969,10 +5850,8 @@ fn test_isolation_market_a_loss_does_not_change_market_b_total_staked() {
     env.stake_in(&slab2, &bob, 1_000_000);
 
     // Read total_staked for both markets
-    let (mrc1, _) = Pubkey::find_program_address(
-        &[b"mrc", slab1.as_ref()], &env.rewards_id);
-    let (mrc2, _) = Pubkey::find_program_address(
-        &[b"mrc", slab2.as_ref()], &env.rewards_id);
+    let (mrc1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (mrc2, _) = Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
     let mrc1_data = env.svm.get_account(&mrc1).unwrap();
     let mrc2_data = env.svm.get_account(&mrc2).unwrap();
     let total1_before = u64::from_le_bytes(mrc1_data.data[152..160].try_into().unwrap());
@@ -4990,7 +5869,10 @@ fn test_isolation_market_a_loss_does_not_change_market_b_total_staked() {
     let total1_after = u64::from_le_bytes(mrc1_after.data[152..160].try_into().unwrap());
     let total2_after = u64::from_le_bytes(mrc2_after.data[152..160].try_into().unwrap());
     assert_eq!(total1_after, 0, "Market 1 fully withdrawn");
-    assert_eq!(total2_after, 1_000_000, "Market 2 total_staked must be unchanged");
+    assert_eq!(
+        total2_after, 1_000_000,
+        "Market 2 total_staked must be unchanged"
+    );
 }
 
 #[test]
@@ -5029,9 +5911,16 @@ fn test_isolation_dao_can_only_drain_after_local_market_depositors_exit() {
     // BUT market 2 still has Bob's deposit. DAO can only draw market 2's profit.
     // Market 2: vault=1.1M, total_staked=1M, profit=100K
     let result = env.try_draw_insurance_from(&slab2, 200_000, &dao_dest);
-    assert!(result.is_err(), "Market 2: can only draw 100K profit, not 200K");
+    assert!(
+        result.is_err(),
+        "Market 2: can only draw 100K profit, not 200K"
+    );
     env.draw_insurance_from(&slab2, 100_000, &dao_dest);
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "Market 2: only profit drawn");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "Market 2: only profit drawn"
+    );
 
     // Bob still gets his full deposit
     let (bob_col, _) = env.unstake_in_get_atas(&slab2, &bob, 1_000_000);
@@ -5055,25 +5944,28 @@ fn test_isolation_dao_can_only_drain_after_local_market_depositors_exit() {
 fn test_e2e_register_insurance_operator_sets_header() {
     // Verify the bootstrap ceremony actually updated the percolator header.
     let mut env = TestEnv::new();
-    let (mrc_pda, _) = Pubkey::find_program_address(
-        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (mrc_pda, _) = Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
 
     // Before init_market_rewards, admin is still self.payer.
-    let header_pre = percolator_prog::state::read_header(
-        &env.svm.get_account(&env.slab).unwrap().data);
+    let header_pre = read_percolator_config(&env.svm.get_account(&env.slab).unwrap().data);
     assert_eq!(Pubkey::new_from_array(header_pre.admin), env.payer.pubkey());
-    assert_eq!(Pubkey::new_from_array(header_pre.insurance_operator), env.payer.pubkey(),
-        "before registration, operator defaults to admin");
+    assert_eq!(
+        Pubkey::new_from_array(header_pre.insurance_operator),
+        env.payer.pubkey(),
+        "before registration, operator defaults to admin"
+    );
 
     env.init_coin_config();
     env.init_market_rewards(1000, 100);
 
     // After: operator should be MRC PDA, admin burned.
-    let header_post = percolator_prog::state::read_header(
-        &env.svm.get_account(&env.slab).unwrap().data);
+    let header_post = read_percolator_config(&env.svm.get_account(&env.slab).unwrap().data);
     assert_eq!(header_post.admin, [0u8; 32], "admin burned");
-    assert_eq!(Pubkey::new_from_array(header_post.insurance_operator), mrc_pda,
-        "insurance_operator = MRC PDA");
+    assert_eq!(
+        Pubkey::new_from_array(header_post.insurance_operator),
+        mrc_pda,
+        "insurance_operator = MRC PDA"
+    );
 }
 
 #[test]
@@ -5109,6 +6001,31 @@ fn test_e2e_pull_insurance_succeeds_when_operator_registered() {
 }
 
 #[test]
+fn test_pull_insurance_rejects_caller_supplied_program_id() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 1_000_000);
+
+    let slab = env.slab;
+    env.topup_percolator_insurance(&slab, 500_000);
+    let fake_program = Pubkey::new_unique();
+    let before_stake_vault = env.vault_balance();
+    let before_insurance = env.percolator_insurance_balance(&slab);
+
+    let result = env.try_pull_insurance_with_program(&slab, 500_000, &fake_program);
+    assert!(
+        result.is_err(),
+        "pull_insurance must reject a caller-supplied non-Percolator program id"
+    );
+    assert_eq!(env.vault_balance(), before_stake_vault);
+    assert_eq!(env.percolator_insurance_balance(&slab), before_insurance);
+}
+
+#[test]
 fn test_e2e_pull_then_draw_extracts_real_profit_to_dao() {
     // Full profit-extraction flow: stake → fees → pull → draw.
     let mut env = TestEnv::new();
@@ -5132,8 +6049,16 @@ fn test_e2e_pull_then_draw_extracts_real_profit_to_dao() {
     env.advance_blockhash();
     env.draw_insurance(300_000, &dao_dest);
 
-    assert_eq!(env.read_token_balance(&dao_dest), 300_000, "DAO extracted real profit");
-    assert_eq!(env.vault_balance(), 1_000_000, "vault back to depositor capital");
+    assert_eq!(
+        env.read_token_balance(&dao_dest),
+        300_000,
+        "DAO extracted real profit"
+    );
+    assert_eq!(
+        env.vault_balance(),
+        1_000_000,
+        "vault back to depositor capital"
+    );
     assert_eq!(env.percolator_insurance_balance(&slab), 0);
 
     // Depositor capital is still intact — Alice can withdraw full 1M.
@@ -5163,7 +6088,10 @@ fn test_e2e_pull_insurance_requires_operator_pda() {
 
     env.set_clock(200);
     let result = env.try_pull_insurance(&slab, 500_000);
-    assert!(result.is_err(), "pull must fail when MRC PDA is not insurance_operator");
+    assert!(
+        result.is_err(),
+        "pull must fail when MRC PDA is not insurance_operator"
+    );
     // Percolator insurance balance unchanged
     assert_eq!(env.percolator_insurance_balance(&slab), 500_000);
     // Our vault unchanged
@@ -5227,13 +6155,17 @@ fn test_e2e_multi_market_pull_isolation() {
     assert_eq!(env.percolator_insurance_balance(&slab1), 0);
     assert_eq!(env.percolator_insurance_balance(&slab2), 0);
     assert_eq!(env.vault_balance_for(&slab1), 1_200_000);
-    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "market 2 vault untouched");
+    assert_eq!(
+        env.vault_balance_for(&slab2),
+        1_000_000,
+        "market 2 vault untouched"
+    );
 
     // Verify each market's operator is its own MRC PDA.
     let (mrc1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
     let (mrc2, _) = Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
-    let h1 = percolator_prog::state::read_header(&env.svm.get_account(&slab1).unwrap().data);
-    let h2 = percolator_prog::state::read_header(&env.svm.get_account(&slab2).unwrap().data);
+    let h1 = read_percolator_config(&env.svm.get_account(&slab1).unwrap().data);
+    let h2 = read_percolator_config(&env.svm.get_account(&slab2).unwrap().data);
     assert_eq!(Pubkey::new_from_array(h1.insurance_operator), mrc1);
     assert_eq!(Pubkey::new_from_array(h2.insurance_operator), mrc2);
     assert_ne!(mrc1, mrc2);
@@ -5262,13 +6194,11 @@ fn test_e2e_cross_market_cannot_pull_using_wrong_mrc() {
 
     // Build a malicious pull: market 1's MRC as operator, market 2's vault as source
     let (mrc1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
-    let (stake_vault1, _) = Pubkey::find_program_address(
-        &[b"stake_vault", slab1.as_ref()], &env.rewards_id);
-    let slab2_data = env.svm.get_account(&slab2).unwrap().data;
-    let config2 = percolator_prog::state::read_config(&slab2_data);
-    let perc_vault2 = Pubkey::new_from_array(config2.vault_pubkey);
-    let (perc_vault_pda2, _) = Pubkey::find_program_address(
-        &[b"vault", slab2.as_ref()], &env.percolator_id);
+    let (stake_vault1, _) =
+        Pubkey::find_program_address(&[b"stake_vault", slab1.as_ref()], &env.rewards_id);
+    let perc_vault2 = env.percolator_vault_for_slab(&slab2);
+    let (perc_vault_pda2, _) =
+        Pubkey::find_program_address(&[b"vault", slab2.as_ref()], &env.percolator_id);
 
     let mut data = vec![7u8]; // IX_PULL_INSURANCE
     data.extend_from_slice(&500_000u64.to_le_bytes());
@@ -5281,10 +6211,10 @@ fn test_e2e_cross_market_cannot_pull_using_wrong_mrc() {
         program_id: env.rewards_id,
         accounts: vec![
             AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(mrc1, false),        // Market 1 MRC
-            AccountMeta::new(slab2, false),                 // Market 2 slab
-            AccountMeta::new(stake_vault1, false),          // Market 1 stake_vault
-            AccountMeta::new(perc_vault2, false),           // Market 2 percolator vault
+            AccountMeta::new_readonly(mrc1, false), // Market 1 MRC
+            AccountMeta::new(slab2, false),         // Market 2 slab
+            AccountMeta::new(stake_vault1, false),  // Market 1 stake_vault
+            AccountMeta::new(perc_vault2, false),   // Market 2 percolator vault
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(perc_vault_pda2, false),
             AccountMeta::new_readonly(sysvar::clock::ID, false),
@@ -5294,8 +6224,11 @@ fn test_e2e_cross_market_cannot_pull_using_wrong_mrc() {
     };
     let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
     let tx = Transaction::new_signed_with_payer(
-        &[cu_ix, ix], Some(&payer.pubkey()),
-        &[&payer], env.svm.latest_blockhash());
+        &[cu_ix, ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        env.svm.latest_blockhash(),
+    );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "cross-market pull must be rejected");
 
@@ -5345,7 +6278,11 @@ fn test_e2e_full_lifecycle_with_real_cpi() {
     env.advance_blockhash();
     env.draw_insurance(500_000, &dao_dest);
     assert_eq!(env.read_token_balance(&dao_dest), 500_000);
-    assert_eq!(env.vault_balance(), 2_000_000, "only depositor capital left");
+    assert_eq!(
+        env.vault_balance(),
+        2_000_000,
+        "only depositor capital left"
+    );
 
     // DAO cannot draw more (all profit extracted)
     env.advance_blockhash();
@@ -5357,15 +6294,26 @@ fn test_e2e_full_lifecycle_with_real_cpi() {
     let (alice_col, alice_coin) = env.unstake_and_get_atas(&alice, 1_000_000);
     let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
 
-    assert_eq!(env.read_token_balance(&alice_col), 1_000_000, "Alice: full deposit");
-    assert_eq!(env.read_token_balance(&bob_col), 1_000_000, "Bob: full deposit");
+    assert_eq!(
+        env.read_token_balance(&alice_col),
+        1_000_000,
+        "Alice: full deposit"
+    );
+    assert_eq!(
+        env.read_token_balance(&bob_col),
+        1_000_000,
+        "Bob: full deposit"
+    );
 
     // COIN rewards: over ~3 epochs (slot 100 → 400), 1000 × 3 = 3000 total COIN
     let alice_c = env.read_token_balance(&alice_coin);
     let bob_c = env.read_token_balance(&bob_coin);
     let total_coin = alice_c + bob_c;
-    assert!(total_coin >= 2998 && total_coin <= 3000,
-        "Total COIN ~3000, got {}", total_coin);
+    assert!(
+        total_coin >= 2998 && total_coin <= 3000,
+        "Total COIN ~3000, got {}",
+        total_coin
+    );
 
     // Final state: everything drained
     assert_eq!(env.vault_balance(), 0);

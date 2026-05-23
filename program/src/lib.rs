@@ -12,8 +12,7 @@ use alloc::format; // Required by entrypoint! macro in SBF builds
 
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
-    declare_id,
-    entrypoint,
+    declare_id, entrypoint,
     entrypoint::ProgramResult,
     msg,
     program::{invoke, invoke_signed},
@@ -27,7 +26,9 @@ use solana_program::{
 
 declare_id!("Rewards111111111111111111111111111111111111");
 
-use governance_adapter::{authority_address as governance_authority_address, id as governance_program_id};
+use governance_adapter::{
+    authority_address as governance_authority_address, id as governance_program_id,
+};
 use percolator_prog::state;
 
 /// Fixed-point scale for reward math.
@@ -52,9 +53,11 @@ const IX_REGISTER_INSURANCE_OPERATOR: u8 = 6;
 /// facing instructions and draw_insurance can redistribute the pulled
 /// funds.
 const IX_PULL_INSURANCE: u8 = 7;
+const IX_MINT_REWARD: u8 = 8;
+const IX_SET_MARKET_REWARDS: u8 = 9;
+const IX_TRANSFER_MINT_AUTHORITY: u8 = 10;
 
 /// Percolator instruction tags we CPI into
-const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
 const PERC_AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
@@ -104,14 +107,18 @@ fn stake_vault_seeds(market_slab: &Pubkey) -> [&[u8]; 2] {
 // ============================================================================
 
 fn read_u8(data: &mut &[u8]) -> Result<u8, ProgramError> {
-    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
+    if data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let val = data[0];
     *data = &data[1..];
     Ok(val)
 }
 
 fn read_u64(data: &mut &[u8]) -> Result<u64, ProgramError> {
-    if data.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
+    if data.len() < 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let val = u64::from_le_bytes(data[..8].try_into().unwrap());
     *data = &data[8..];
     Ok(val)
@@ -127,8 +134,12 @@ struct CoinConfig {
 
 impl CoinConfig {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < COIN_CFG_SIZE { return Err(ProgramError::InvalidAccountData); }
-        if data[..8] != COIN_CFG_DISC { return Err(ProgramError::InvalidAccountData); }
+        if data.len() < COIN_CFG_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != COIN_CFG_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let authority = Pubkey::new_from_array(data[8..40].try_into().unwrap());
         Ok(Self { authority })
     }
@@ -144,47 +155,76 @@ impl CoinConfig {
 // ============================================================================
 
 struct MarketRewardsCfg {
-    market_slab: Pubkey,        // [8..40]
-    coin_mint: Pubkey,          // [40..72]
-    collateral_mint: Pubkey,    // [72..104]
-    n_per_epoch: u64,           // [104..112] COIN emitted per epoch to stakers
-    epoch_slots: u64,           // [112..120] minimum lockup / reward period
-    market_start_slot: u64,     // [120..128] from slab
+    market_slab: Pubkey,           // [8..40]
+    coin_mint: Pubkey,             // [40..72]
+    collateral_mint: Pubkey,       // [72..104]
+    n_per_epoch: u64,              // [104..112] COIN emitted per epoch to stakers
+    epoch_slots: u64,              // [112..120] minimum lockup / reward period
+    market_start_slot: u64,        // [120..128] from slab
     reward_per_token_stored: u128, // [128..144] accumulator (FP)
-    last_update_slot: u64,      // [144..152]
-    total_staked: u64,          // [152..160]
+    last_update_slot: u64,         // [144..152]
+    total_staked: u64,             // [152..160]
 }
 
 impl MarketRewardsCfg {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < MRC_SIZE { return Err(ProgramError::InvalidAccountData); }
-        if data[..8] != MRC_DISC { return Err(ProgramError::InvalidAccountData); }
+        if data.len() < MRC_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != MRC_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let mut off = 8;
-        let market_slab = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
-        let coin_mint = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
-        let collateral_mint = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
-        let n_per_epoch = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-        let epoch_slots = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-        let market_start_slot = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-        let reward_per_token_stored = u128::from_le_bytes(data[off..off+16].try_into().unwrap()); off += 16;
-        let last_update_slot = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
-        let total_staked = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-        Ok(Self { market_slab, coin_mint, collateral_mint, n_per_epoch, epoch_slots,
-                  market_start_slot, reward_per_token_stored, last_update_slot, total_staked })
+        let market_slab = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        off += 32;
+        let coin_mint = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        off += 32;
+        let collateral_mint = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        off += 32;
+        let n_per_epoch = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let epoch_slots = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let market_start_slot = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let reward_per_token_stored = u128::from_le_bytes(data[off..off + 16].try_into().unwrap());
+        off += 16;
+        let last_update_slot = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        off += 8;
+        let total_staked = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        Ok(Self {
+            market_slab,
+            coin_mint,
+            collateral_mint,
+            n_per_epoch,
+            epoch_slots,
+            market_start_slot,
+            reward_per_token_stored,
+            last_update_slot,
+            total_staked,
+        })
     }
 
     fn serialize(&self, data: &mut [u8]) {
         data[..8].copy_from_slice(&MRC_DISC);
         let mut off = 8;
-        data[off..off+32].copy_from_slice(self.market_slab.as_ref()); off += 32;
-        data[off..off+32].copy_from_slice(self.coin_mint.as_ref()); off += 32;
-        data[off..off+32].copy_from_slice(self.collateral_mint.as_ref()); off += 32;
-        data[off..off+8].copy_from_slice(&self.n_per_epoch.to_le_bytes()); off += 8;
-        data[off..off+8].copy_from_slice(&self.epoch_slots.to_le_bytes()); off += 8;
-        data[off..off+8].copy_from_slice(&self.market_start_slot.to_le_bytes()); off += 8;
-        data[off..off+16].copy_from_slice(&self.reward_per_token_stored.to_le_bytes()); off += 16;
-        data[off..off+8].copy_from_slice(&self.last_update_slot.to_le_bytes()); off += 8;
-        data[off..off+8].copy_from_slice(&self.total_staked.to_le_bytes());
+        data[off..off + 32].copy_from_slice(self.market_slab.as_ref());
+        off += 32;
+        data[off..off + 32].copy_from_slice(self.coin_mint.as_ref());
+        off += 32;
+        data[off..off + 32].copy_from_slice(self.collateral_mint.as_ref());
+        off += 32;
+        data[off..off + 8].copy_from_slice(&self.n_per_epoch.to_le_bytes());
+        off += 8;
+        data[off..off + 8].copy_from_slice(&self.epoch_slots.to_le_bytes());
+        off += 8;
+        data[off..off + 8].copy_from_slice(&self.market_start_slot.to_le_bytes());
+        off += 8;
+        data[off..off + 16].copy_from_slice(&self.reward_per_token_stored.to_le_bytes());
+        off += 16;
+        data[off..off + 8].copy_from_slice(&self.last_update_slot.to_le_bytes());
+        off += 8;
+        data[off..off + 8].copy_from_slice(&self.total_staked.to_le_bytes());
     }
 }
 
@@ -193,21 +233,30 @@ impl MarketRewardsCfg {
 // ============================================================================
 
 struct StakePosition {
-    amount: u64,                   // [8..16]
-    deposit_slot: u64,             // [16..24]
-    reward_per_token_paid: u128,   // [24..40]
-    pending_rewards: u64,          // [40..48]
+    amount: u64,                 // [8..16]
+    deposit_slot: u64,           // [16..24]
+    reward_per_token_paid: u128, // [24..40]
+    pending_rewards: u64,        // [40..48]
 }
 
 impl StakePosition {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < SP_SIZE { return Err(ProgramError::InvalidAccountData); }
-        if data[..8] != SP_DISC { return Err(ProgramError::InvalidAccountData); }
+        if data.len() < SP_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data[..8] != SP_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let amount = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let deposit_slot = u64::from_le_bytes(data[16..24].try_into().unwrap());
         let reward_per_token_paid = u128::from_le_bytes(data[24..40].try_into().unwrap());
         let pending_rewards = u64::from_le_bytes(data[40..48].try_into().unwrap());
-        Ok(Self { amount, deposit_slot, reward_per_token_paid, pending_rewards })
+        Ok(Self {
+            amount,
+            deposit_slot,
+            reward_per_token_paid,
+            pending_rewards,
+        })
     }
 
     fn serialize(&self, data: &mut [u8]) {
@@ -241,7 +290,13 @@ fn create_pda_account<'a>(
     let bump_bytes = [bump];
     seeds_with_bump.push(&bump_bytes);
     invoke_signed(
-        &system_instruction::create_account(payer.key, target.key, lamports, size as u64, program_id),
+        &system_instruction::create_account(
+            payer.key,
+            target.key,
+            lamports,
+            size as u64,
+            program_id,
+        ),
         &[payer.clone(), target.clone(), system_program.clone()],
         &[&seeds_with_bump],
     )
@@ -277,6 +332,48 @@ fn validate_token_account(
     Ok(())
 }
 
+fn verify_percolator_program(percolator_program: &AccountInfo) -> ProgramResult {
+    if *percolator_program.key != percolator_prog::id() {
+        msg!("Unexpected Percolator program id");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+fn load_percolator_market_config(
+    market_slab: &AccountInfo,
+    expected_collateral_mint: &Pubkey,
+) -> Result<state::WrapperConfigV16, ProgramError> {
+    if market_slab.owner != &percolator_prog::id() {
+        msg!("Market slab must be owned by Percolator");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let slab_data = market_slab.try_borrow_data()?;
+    let (config, _, _, _) = state::read_market_config_mode_and_capacity(&slab_data)?;
+    if config.collateral_mint != expected_collateral_mint.to_bytes() {
+        msg!("Percolator slab collateral mint mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(config)
+}
+
+fn validate_percolator_vault_accounts(
+    market_slab: &AccountInfo,
+    percolator_vault: &AccountInfo,
+    percolator_vault_pda: &AccountInfo,
+    collateral_mint: &Pubkey,
+) -> ProgramResult {
+    let (expected_vault_authority, _) = Pubkey::find_program_address(
+        &[b"vault", market_slab.key.as_ref()],
+        &percolator_prog::id(),
+    );
+    if *percolator_vault_pda.key != expected_vault_authority {
+        msg!("Percolator vault authority PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    validate_token_account(percolator_vault, collateral_mint, &expected_vault_authority)
+}
+
 /// Mint COIN tokens via PDA authority.
 fn mint_coin<'a>(
     token_program: &AccountInfo<'a>,
@@ -286,7 +383,9 @@ fn mint_coin<'a>(
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    if amount == 0 { return Ok(()); }
+    if amount == 0 {
+        return Ok(());
+    }
     let ix = spl_token::instruction::mint_to(
         token_program.key,
         coin_mint.key,
@@ -297,7 +396,12 @@ fn mint_coin<'a>(
     )?;
     invoke_signed(
         &ix,
-        &[coin_mint.clone(), destination.clone(), mint_authority.clone(), token_program.clone()],
+        &[
+            coin_mint.clone(),
+            destination.clone(),
+            mint_authority.clone(),
+            token_program.clone(),
+        ],
         &[signer_seeds],
     )
 }
@@ -323,7 +427,9 @@ fn update_accumulator(cfg: &mut MarketRewardsCfg, current_slot: u64) {
 
 /// Compute earned COIN for a position, add to pending.
 fn settle_pending(pos: &mut StakePosition, reward_per_token: u128) {
-    if pos.amount == 0 { return; }
+    if pos.amount == 0 {
+        return;
+    }
     let delta = reward_per_token.saturating_sub(pos.reward_per_token_paid);
     let (lo, hi) = mul_u128_wide(pos.amount as u128, delta);
     // Divide by FP (>> 64)
@@ -340,8 +446,12 @@ fn load_coin_config(
     program_id: &Pubkey,
 ) -> Result<CoinConfig, ProgramError> {
     let (expected_cfg, _) = Pubkey::find_program_address(&coin_cfg_seeds(coin_mint), program_id);
-    if *coin_cfg_account.key != expected_cfg { return Err(ProgramError::InvalidSeeds); }
-    if coin_cfg_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    if *coin_cfg_account.key != expected_cfg {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if coin_cfg_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
     let cfg_data = coin_cfg_account.try_borrow_data()?;
     CoinConfig::deserialize(&cfg_data)
 }
@@ -391,6 +501,9 @@ pub fn process_instruction<'a>(
         IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
         IX_REGISTER_INSURANCE_OPERATOR => process_register_insurance_operator(program_id, accounts),
         IX_PULL_INSURANCE => process_pull_insurance(program_id, accounts, &mut data),
+        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
+        IX_SET_MARKET_REWARDS => process_set_market_rewards(program_id, accounts, &mut data),
+        IX_TRANSFER_MINT_AUTHORITY => process_transfer_mint_authority(program_id, accounts),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -433,10 +546,8 @@ fn process_init_coin_config<'a>(
         msg!("COIN mint must have freeze_authority = None");
         return Err(ProgramError::InvalidAccountData);
     }
-    let (expected_mint_auth, _) = Pubkey::find_program_address(
-        &mint_authority_seeds(coin_mint.key),
-        program_id,
-    );
+    let (expected_mint_auth, _) =
+        Pubkey::find_program_address(&mint_authority_seeds(coin_mint.key), program_id);
     match mint_info.mint_authority {
         solana_program::program_option::COption::Some(auth) if auth == expected_mint_auth => {}
         _ => {
@@ -448,10 +559,19 @@ fn process_init_coin_config<'a>(
 
     // Create CoinConfig PDA (init guard)
     let seeds = coin_cfg_seeds(coin_mint.key);
-    create_pda_account(payer, coin_cfg_account, system_program, program_id, &seeds, COIN_CFG_SIZE)?;
+    create_pda_account(
+        payer,
+        coin_cfg_account,
+        system_program,
+        program_id,
+        &seeds,
+        COIN_CFG_SIZE,
+    )?;
 
     let mut cfg_data = coin_cfg_account.try_borrow_mut_data()?;
-    let cfg = CoinConfig { authority: *authority.key };
+    let cfg = CoinConfig {
+        authority: *authority.key,
+    };
     cfg.serialize(&mut cfg_data);
 
     Ok(())
@@ -517,25 +637,26 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Verify slab is initialized and admin is burned.
-    let slab_data = market_slab.try_borrow_data()?;
-    let header = state::read_header(&slab_data);
-    if header.magic == 0 {
-        msg!("Slab not initialized (magic = 0)");
-        return Err(ProgramError::InvalidAccountData);
-    }
-    if header.admin != [0u8; 32] {
+    // Verify market is a real Percolator market for this collateral and admin is burned.
+    let config = load_percolator_market_config(market_slab, collateral_mint.key)?;
+    if config.admin != [0u8; 32] {
         msg!("Percolator market admin must be burned before rewards init");
         return Err(ProgramError::InvalidAccountData);
     }
-    drop(slab_data);
     // Use current clock slot as the market start for reward tracking
     let clock_for_init = Clock::get()?;
     let market_start_slot = clock_for_init.slot;
 
     // Create MarketRewardsCfg PDA (init guard)
     let seeds = mrc_seeds(market_slab.key);
-    create_pda_account(payer, mrc_account, system_program, program_id, &seeds, MRC_SIZE)?;
+    create_pda_account(
+        payer,
+        mrc_account,
+        system_program,
+        program_id,
+        &seeds,
+        MRC_SIZE,
+    )?;
 
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let cfg = MarketRewardsCfg {
@@ -555,7 +676,9 @@ fn process_init_market_rewards<'a>(
     // Create stake vault — SPL token account PDA
     let vault_seeds = stake_vault_seeds(market_slab.key);
     let (expected_vault, vault_bump) = Pubkey::find_program_address(&vault_seeds, program_id);
-    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    if *stake_vault.key != expected_vault {
+        return Err(ProgramError::InvalidSeeds);
+    }
 
     let vault_signer_seeds: [&[u8]; 3] = [b"stake_vault", market_slab.key.as_ref(), &[vault_bump]];
     let rent = Rent::get()?;
@@ -581,7 +704,12 @@ fn process_init_market_rewards<'a>(
     )?;
     invoke(
         &init_ix,
-        &[stake_vault.clone(), collateral_mint.clone(), rent_sysvar.clone(), token_program.clone()],
+        &[
+            stake_vault.clone(),
+            collateral_mint.clone(),
+            rent_sysvar.clone(),
+            token_program.clone(),
+        ],
     )?;
 
     Ok(())
@@ -620,20 +748,33 @@ fn process_stake<'a>(
     let clock_info = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
-    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
-    if !user.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Read and verify MRC
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let mut cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
-    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != cfg.market_slab {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Verify stake vault
-    let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
-    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    let (expected_vault, _) =
+        Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault {
+        return Err(ProgramError::InvalidSeeds);
+    }
     verify_token_program(token_program)?;
     validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
     validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
@@ -646,20 +787,36 @@ fn process_stake<'a>(
     // Load or create StakePosition
     let sp_seeds_arr = sp_seeds(&cfg.market_slab, user.key);
     let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
-    if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
+    if *sp_account.key != expected_sp {
+        return Err(ProgramError::InvalidSeeds);
+    }
 
     let mut pos = if sp_account.data_len() == 0 || sp_account.lamports() == 0 {
         // First stake (or re-stake after full withdrawal closed the account)
         drop(mrc_data); // release borrow for CPI
-        create_pda_account(user, sp_account, system_program, program_id, &sp_seeds_arr, SP_SIZE)?;
+        create_pda_account(
+            user,
+            sp_account,
+            system_program,
+            program_id,
+            &sp_seeds_arr,
+            SP_SIZE,
+        )?;
         mrc_data = mrc_account.try_borrow_mut_data()?;
         let mut sp_data = sp_account.try_borrow_mut_data()?;
         sp_data[..8].copy_from_slice(&SP_DISC);
         sp_data[8..SP_SIZE].fill(0);
         drop(sp_data);
-        StakePosition { amount: 0, deposit_slot: 0, reward_per_token_paid: 0, pending_rewards: 0 }
+        StakePosition {
+            amount: 0,
+            deposit_slot: 0,
+            reward_per_token_paid: 0,
+            pending_rewards: 0,
+        }
     } else {
-        if sp_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+        if sp_account.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
         let sp_data = sp_account.try_borrow_data()?;
         let p = StakePosition::deserialize(&sp_data)?;
         drop(sp_data);
@@ -670,18 +827,37 @@ fn process_stake<'a>(
     settle_pending(&mut pos, cfg.reward_per_token_stored);
 
     // Update MRC total_staked and serialize before CPI (preserves accumulator update)
-    cfg.total_staked = cfg.total_staked.checked_add(amount).ok_or(ProgramError::ArithmeticOverflow)?;
+    cfg.total_staked = cfg
+        .total_staked
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     cfg.serialize(&mut mrc_data);
 
     // Transfer collateral from user to vault
     let xfer_ix = spl_token::instruction::transfer(
-        token_program.key, user_ata.key, stake_vault.key, user.key, &[], amount,
+        token_program.key,
+        user_ata.key,
+        stake_vault.key,
+        user.key,
+        &[],
+        amount,
     )?;
     drop(mrc_data); // release borrow for CPI
-    invoke(&xfer_ix, &[user_ata.clone(), stake_vault.clone(), user.clone(), token_program.clone()])?;
+    invoke(
+        &xfer_ix,
+        &[
+            user_ata.clone(),
+            stake_vault.clone(),
+            user.clone(),
+            token_program.clone(),
+        ],
+    )?;
 
     // Update position
-    pos.amount = pos.amount.checked_add(amount).ok_or(ProgramError::ArithmeticOverflow)?;
+    pos.amount = pos
+        .amount
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     pos.deposit_slot = clock.slot;
     pos.reward_per_token_paid = cfg.reward_per_token_stored;
 
@@ -737,20 +913,33 @@ fn process_unstake<'a>(
     let clock_info = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
-    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
-    if !user.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Read and verify MRC
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let mut cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
-    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != cfg.market_slab {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Verify stake vault PDA
-    let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
-    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    let (expected_vault, _) =
+        Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault {
+        return Err(ProgramError::InvalidSeeds);
+    }
     verify_token_program(token_program)?;
     validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
     validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
@@ -764,8 +953,12 @@ fn process_unstake<'a>(
     // Load and verify StakePosition PDA belongs to this user
     let sp_seeds_arr = sp_seeds(&cfg.market_slab, user.key);
     let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
-    if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
-    if sp_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    if *sp_account.key != expected_sp {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if sp_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
     let sp_data_r = sp_account.try_borrow_data()?;
     let mut pos = StakePosition::deserialize(&sp_data_r)?;
     drop(sp_data_r);
@@ -809,12 +1002,22 @@ fn process_unstake<'a>(
 
     if actual_withdrawal > 0 {
         let xfer_ix = spl_token::instruction::transfer(
-            token_program.key, stake_vault.key, user_ata.key, mrc_account.key, &[], actual_withdrawal,
+            token_program.key,
+            stake_vault.key,
+            user_ata.key,
+            mrc_account.key,
+            &[],
+            actual_withdrawal,
         )?;
         drop(mrc_data); // release for CPI
         invoke_signed(
             &xfer_ix,
-            &[stake_vault.clone(), user_ata.clone(), mrc_account.clone(), token_program.clone()],
+            &[
+                stake_vault.clone(),
+                user_ata.clone(),
+                mrc_account.clone(),
+                token_program.clone(),
+            ],
             &[&mrc_signer],
         )?;
     } else {
@@ -824,13 +1027,25 @@ fn process_unstake<'a>(
     // Mint pending COIN rewards
     let pending = pos.pending_rewards;
     if pending > 0 {
-        if *coin_mint.key != cfg.coin_mint { return Err(ProgramError::InvalidAccountData); }
+        if *coin_mint.key != cfg.coin_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let ma_seeds = mint_authority_seeds(&cfg.coin_mint);
         let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
-        if *mint_authority.key != expected_ma { return Err(ProgramError::InvalidSeeds); }
+        if *mint_authority.key != expected_ma {
+            return Err(ProgramError::InvalidSeeds);
+        }
         let bump_bytes = [ma_bump];
-        let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
-        mint_coin(token_program, coin_mint, user_coin_ata, mint_authority, pending, &signer_seeds)?;
+        let signer_seeds: [&[u8]; 3] =
+            [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
+        mint_coin(
+            token_program,
+            coin_mint,
+            user_coin_ata,
+            mint_authority,
+            pending,
+            &signer_seeds,
+        )?;
     }
 
     // Update position
@@ -883,21 +1098,33 @@ fn process_claim_stake_rewards<'a>(
     let token_program = next_account_info(iter)?;
     let clock_info = next_account_info(iter)?;
 
-    if !user.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if !user.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Read and verify MRC
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let mut cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
-    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != cfg.market_slab {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Verify StakePosition PDA
     let sp_seeds_arr = sp_seeds(&cfg.market_slab, user.key);
     let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
-    if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
-    if sp_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    if *sp_account.key != expected_sp {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if sp_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
     verify_token_program(token_program)?;
     validate_token_account(user_coin_ata, &cfg.coin_mint, user.key)?;
 
@@ -917,13 +1144,25 @@ fn process_claim_stake_rewards<'a>(
 
     let pending = pos.pending_rewards;
     if pending > 0 {
-        if *coin_mint.key != cfg.coin_mint { return Err(ProgramError::InvalidAccountData); }
+        if *coin_mint.key != cfg.coin_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let ma_seeds = mint_authority_seeds(&cfg.coin_mint);
         let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
-        if *mint_authority.key != expected_ma { return Err(ProgramError::InvalidSeeds); }
+        if *mint_authority.key != expected_ma {
+            return Err(ProgramError::InvalidSeeds);
+        }
         let bump_bytes = [ma_bump];
-        let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
-        mint_coin(token_program, coin_mint, user_coin_ata, mint_authority, pending, &signer_seeds)?;
+        let signer_seeds: [&[u8]; 3] =
+            [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
+        mint_coin(
+            token_program,
+            coin_mint,
+            user_coin_ata,
+            mint_authority,
+            pending,
+            &signer_seeds,
+        )?;
         pos.pending_rewards = 0;
     }
 
@@ -971,8 +1210,12 @@ fn process_draw_insurance<'a>(
     let token_program = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
-    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
-    if !payer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     verify_token_program(token_program)?;
     validate_governance_authority(authority, coin_mint.key, program_id)?;
@@ -988,15 +1231,26 @@ fn process_draw_insurance<'a>(
     let mrc_data = mrc_account.try_borrow_data()?;
     let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
-    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
-    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
-    if *coin_mint.key != cfg.coin_mint { return Err(ProgramError::InvalidAccountData); }
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != cfg.market_slab {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *coin_mint.key != cfg.coin_mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
     drop(mrc_data);
 
     // Verify stake vault PDA
-    let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
-    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    let (expected_vault, _) =
+        Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault {
+        return Err(ProgramError::InvalidSeeds);
+    }
     validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
 
     // Verify destination is correct mint
@@ -1022,12 +1276,189 @@ fn process_draw_insurance<'a>(
     let mrc_signer: [&[u8]; 3] = [b"mrc", cfg.market_slab.as_ref(), &[mrc_bump]];
 
     let xfer_ix = spl_token::instruction::transfer(
-        token_program.key, stake_vault.key, destination.key, mrc_account.key, &[], amount,
+        token_program.key,
+        stake_vault.key,
+        destination.key,
+        mrc_account.key,
+        &[],
+        amount,
     )?;
     invoke_signed(
         &xfer_ix,
-        &[stake_vault.clone(), destination.clone(), mrc_account.clone(), token_program.clone()],
+        &[
+            stake_vault.clone(),
+            destination.clone(),
+            mrc_account.clone(),
+            token_program.clone(),
+        ],
         &[&mrc_signer],
+    )
+}
+
+// ============================================================================
+// governed reward mint lifecycle
+// ============================================================================
+
+fn process_mint_reward<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    let amount = read_u64(data)?;
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    verify_token_program(token_program)?;
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let destination_token = load_token_account(destination)?;
+    if destination_token.mint != *coin_mint.key {
+        msg!("Reward destination mint mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let ma_seeds = mint_authority_seeds(coin_mint.key);
+    let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
+    if *mint_authority.key != expected_ma {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let bump_bytes = [ma_bump];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
+    mint_coin(
+        token_program,
+        coin_mint,
+        destination,
+        mint_authority,
+        amount,
+        &signer_seeds,
+    )
+}
+
+fn process_set_market_rewards<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let mrc_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let clock_info = next_account_info(iter)?;
+
+    let n_per_epoch = read_u64(data)?;
+    let epoch_slots = read_u64(data)?;
+    if epoch_slots == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut mrc_data = mrc_account.try_borrow_mut_data()?;
+    let mut cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
+    let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
+    if *mrc_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != cfg.market_slab {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *coin_mint.key != cfg.coin_mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let clock = Clock::from_account_info(clock_info)?;
+    update_accumulator(&mut cfg, clock.slot);
+    cfg.n_per_epoch = n_per_epoch;
+    cfg.epoch_slots = epoch_slots;
+    cfg.serialize(&mut mrc_data);
+    Ok(())
+}
+
+fn process_transfer_mint_authority<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let mint_authority = next_account_info(iter)?;
+    let new_authority = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    verify_token_program(token_program)?;
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let ma_seeds = mint_authority_seeds(coin_mint.key);
+    let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
+    if *mint_authority.key != expected_ma {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let new_authority_opt = if *new_authority.key == Pubkey::default() {
+        None
+    } else {
+        Some(new_authority.key)
+    };
+    let ix = spl_token::instruction::set_authority(
+        token_program.key,
+        coin_mint.key,
+        new_authority_opt,
+        spl_token::instruction::AuthorityType::MintTokens,
+        mint_authority.key,
+        &[],
+    )?;
+    let bump_bytes = [ma_bump];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
+    invoke_signed(
+        &ix,
+        &[
+            coin_mint.clone(),
+            mint_authority.clone(),
+            token_program.clone(),
+        ],
+        &[&signer_seeds],
     )
 }
 
@@ -1060,6 +1491,15 @@ fn process_register_insurance_operator<'a>(
 
     if !admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+    verify_percolator_program(percolator_program)?;
+    if market_slab.owner != &percolator_prog::id() {
+        msg!("Market slab must be owned by Percolator");
+        return Err(ProgramError::IllegalOwner);
+    }
+    {
+        let slab_data = market_slab.try_borrow_data()?;
+        state::read_market_config_mode_and_capacity(&slab_data)?;
     }
 
     // Derive expected MRC PDA from market_slab and verify the passed account matches.
@@ -1136,35 +1576,54 @@ fn process_pull_insurance<'a>(
     let percolator_vault = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
     let percolator_vault_pda = next_account_info(iter)?;
-    let clock_info = next_account_info(iter)?;
+    let _clock_info = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
-    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
-    if !payer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !payer.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     verify_token_program(token_program)?;
+    verify_percolator_program(percolator_program)?;
 
     // Verify MRC PDA & derive seeds
     let mrc_data = mrc_account_data_ref(mrc_pda_account, program_id, market_slab.key)?;
     let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
     drop(mrc_data);
+    load_percolator_market_config(market_slab, &cfg.collateral_mint)?;
 
-    let (expected_mrc, mrc_bump) = Pubkey::find_program_address(
-        &mrc_seeds(&cfg.market_slab), program_id);
-    if *mrc_pda_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
+    let (expected_mrc, mrc_bump) =
+        Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
+    if *mrc_pda_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
 
     // Verify stake_vault PDA (destination for the CPI)
-    let (expected_vault, _) = Pubkey::find_program_address(
-        &stake_vault_seeds(&cfg.market_slab), program_id);
-    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    let (expected_vault, _) =
+        Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault {
+        return Err(ProgramError::InvalidSeeds);
+    }
     validate_token_account(stake_vault, &cfg.collateral_mint, mrc_pda_account.key)?;
+    validate_percolator_vault_accounts(
+        market_slab,
+        percolator_vault,
+        percolator_vault_pda,
+        &cfg.collateral_mint,
+    )?;
 
     // Build WithdrawInsuranceLimited(amount) — tag 23.
-    // Accounts: [operator, slab, operator_ata, vault, token_program, vault_pda, clock]
-    let mut ix_data = alloc::vec::Vec::with_capacity(9);
+    // Current Percolator v16 expects vault authority before token program, and
+    // treats any account after token_program as an optional insurance ledger.
+    // insurance ledger, so keep the public meta instruction ABI stable but do
+    // not forward the compatibility clock account into the CPI.
+    let mut ix_data = alloc::vec::Vec::with_capacity(17);
     ix_data.push(PERC_IX_WITHDRAW_INSURANCE_LIMITED);
-    ix_data.extend_from_slice(&amount.to_le_bytes());
+    ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
 
     let ix = solana_program::instruction::Instruction {
         program_id: *percolator_program.key,
@@ -1173,9 +1632,11 @@ fn process_pull_insurance<'a>(
             solana_program::instruction::AccountMeta::new(*market_slab.key, false),
             solana_program::instruction::AccountMeta::new(*stake_vault.key, false),
             solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(
+                *percolator_vault_pda.key,
+                false
+            ),
             solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(*percolator_vault_pda.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(*clock_info.key, false),
         ],
         data: ix_data,
     };
@@ -1189,9 +1650,8 @@ fn process_pull_insurance<'a>(
             market_slab.clone(),
             stake_vault.clone(),
             percolator_vault.clone(),
-            token_program.clone(),
             percolator_vault_pda.clone(),
-            clock_info.clone(),
+            token_program.clone(),
             percolator_program.clone(),
         ],
         &[&signer_seeds],
@@ -1202,7 +1662,7 @@ fn process_pull_insurance<'a>(
 fn mrc_account_data_ref<'a>(
     mrc_account: &'a AccountInfo,
     program_id: &Pubkey,
-    _market_slab: &Pubkey,
+    market_slab: &Pubkey,
 ) -> Result<core::cell::Ref<'a, &'a mut [u8]>, ProgramError> {
     if mrc_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
@@ -1211,6 +1671,11 @@ fn mrc_account_data_ref<'a>(
     // Basic size/disc check — the full PDA check must be done by the caller
     // after reading the slab key from the data.
     if data.len() < MRC_SIZE || data[..8] != MRC_DISC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let cfg = MarketRewardsCfg::deserialize(&data)?;
+    if cfg.market_slab != *market_slab {
+        msg!("MRC market slab mismatch");
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(data)
@@ -1240,9 +1705,15 @@ fn mul_u128_wide(a: u128, b: u128) -> (u128, u128) {
 
 /// Divide a u256 (n_lo, n_hi) by a u128 divisor. Returns u128 (saturates on overflow).
 fn div_u256_by_u128(n_lo: u128, n_hi: u128, d: u128) -> u128 {
-    if d == 0 { return u128::MAX; }
-    if n_hi == 0 { return n_lo / d; }
-    if n_hi >= d { return u128::MAX; } // result would overflow u128
+    if d == 0 {
+        return u128::MAX;
+    }
+    if n_hi == 0 {
+        return n_lo / d;
+    }
+    if n_hi >= d {
+        return u128::MAX;
+    } // result would overflow u128
 
     // Long division: process n_lo bits from high to low.
     // After processing all of n_hi (which is < d), remainder = n_hi.

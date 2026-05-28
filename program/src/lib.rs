@@ -137,7 +137,6 @@ const IX_VOTE_GENESIS_DISTRIBUTION: u8 = 30;
 const IX_APPROVE_BUILDER: u8 = 31;
 const IX_INIT_GENESIS_SQUADS: u8 = 32;
 const IX_HANDOVER_GENESIS_SQUADS: u8 = 33;
-const IX_GENESIS_BOOTSTRAP_WITHDRAW: u8 = 34;
 
 /// Percolator instruction tags we CPI into
 const PERC_IX_INIT_MARKET: u8 = 0;
@@ -1043,9 +1042,6 @@ pub fn process_instruction<'a>(
         }
         IX_GENESIS_DEPOSIT => process_genesis_deposit(program_id, accounts, &mut data),
         IX_GENESIS_WITHDRAW => process_genesis_withdraw(program_id, accounts, &mut data),
-        IX_GENESIS_BOOTSTRAP_WITHDRAW => {
-            process_genesis_bootstrap_withdraw(program_id, accounts, &mut data)
-        }
         IX_GENESIS_MINT_REWARD => process_genesis_mint_reward(program_id, accounts, &mut data),
         IX_FINALIZE_GENESIS => process_finalize_genesis(program_id, accounts, &mut data),
         IX_DRAW_GENESIS_SURPLUS => process_draw_genesis_surplus(program_id, accounts, &mut data),
@@ -1773,119 +1769,6 @@ fn process_genesis_deposit<'a>(
     Ok(())
 }
 
-// genesis_withdraw accounts:
-//   [0] user (signer)
-//   [1] genesis_config PDA (writable)
-//   [2] genesis_position PDA (writable)
-//   [3] coin_mint
-//   [4] user_base_ata (writable)
-//   [5] genesis_vault (writable)
-//   [6] market_admin PDA
-//   [7] token_program
-//
-// Data: none. Withdraw retires the user's vote position and returns up to
-// their deposited principal, pro-rated by the recovered vault balance.
-
-fn process_genesis_withdraw<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let iter = &mut accounts.iter();
-    let user = next_account_info(iter)?;
-    let genesis_cfg_account = next_account_info(iter)?;
-    let genesis_position = next_account_info(iter)?;
-    let coin_mint = next_account_info(iter)?;
-    let user_base_ata = next_account_info(iter)?;
-    let genesis_vault = next_account_info(iter)?;
-    let market_admin = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-
-    if !user.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_token_program(token_program)?;
-    let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
-    let mut cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
-    if !cfg.is_finalized() {
-        msg!("genesis distribution is not finalized");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    verify_genesis_vault(genesis_vault, &cfg, market_admin.key, program_id)?;
-    validate_token_account(user_base_ata, &cfg.base_mint, user.key)?;
-
-    let position_seeds = genesis_position_seeds(genesis_cfg_account.key, user.key);
-    if *genesis_position.key != Pubkey::find_program_address(&position_seeds, program_id).0 {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    if genesis_position.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let pos_data = genesis_position.try_borrow_data()?;
-    let mut pos = GenesisPosition::deserialize(&pos_data)?;
-    drop(pos_data);
-    if pos.owner != *user.key {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let remaining_principal = pos.amount.saturating_sub(pos.withdrawn);
-    if remaining_principal == 0 {
-        return Ok(());
-    }
-    let outstanding_principal = cfg.outstanding_principal();
-    if outstanding_principal == 0 {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let vault_balance = load_token_account(genesis_vault)?.amount;
-    let actual =
-        genesis_recoverable_principal(remaining_principal, vault_balance, outstanding_principal)?;
-    cfg.total_withdrawn = cfg
-        .total_withdrawn
-        .checked_add(actual)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.withdrawn = pos
-        .withdrawn
-        .checked_add(actual)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.start_slot = 0;
-    let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
-    cfg.serialize(&mut cfg_data);
-    let mut pos_data = genesis_position.try_borrow_mut_data()?;
-    pos.serialize(&mut pos_data);
-    drop(pos_data);
-    drop(cfg_data);
-
-    if actual > 0 {
-        let bump_bytes = [admin_bump];
-        let signer_seeds: [&[u8]; 3] = [
-            b"percolator_market_admin",
-            coin_mint.key.as_ref(),
-            &bump_bytes,
-        ];
-        let xfer_ix = spl_token::instruction::transfer(
-            token_program.key,
-            genesis_vault.key,
-            user_base_ata.key,
-            market_admin.key,
-            &[],
-            actual,
-        )?;
-        invoke_signed(
-            &xfer_ix,
-            &[
-                genesis_vault.clone(),
-                user_base_ata.clone(),
-                market_admin.clone(),
-                token_program.clone(),
-            ],
-            &[&signer_seeds],
-        )?;
-    }
-    Ok(())
-}
-
 /// CPI one capital-protected withdrawal (insurance-limited or backing) from the
 /// genesis market into the genesis vault, signed by the market_admin PDA.
 #[allow(clippy::too_many_arguments)]
@@ -1930,7 +1813,7 @@ fn genesis_pull_from_market<'a>(
     )
 }
 
-// genesis_bootstrap_withdraw accounts:
+// genesis_withdraw accounts:
 //   [0] user (signer)
 //   [1] coin_mint
 //   [2] coin_config PDA
@@ -1940,7 +1823,7 @@ fn genesis_pull_from_market<'a>(
 //   [6] genesis_vault (writable)
 //   [7] market_admin PDA
 //   [8] token_program
-//   -- only when the market has been kicked (capital deployed): --
+//   -- only for the kicked, pre-finalize market pull: --
 //   [9] market_slab (writable)
 //   [10] percolator_vault (writable)
 //   [11] percolator_vault_pda
@@ -1948,17 +1831,19 @@ fn genesis_pull_from_market<'a>(
 //
 // Data: backing_domain (u8), insurance_pull (u64), backing_pull (u64)
 //
-// Permissionless exit available any time before voting starts (i.e. throughout
-// the bootstrap phase, while the COIN is not yet live). The depositor forfeits
-// all vote units and recovers principal:
-//   - Before kickstart: the deposit is still in the genesis vault, so the full
-//     remaining principal is refunded and the genesis pool shrinks.
-//   - After kickstart: the deposit is deployed 50/50 into the market's insurance
-//     fund and backing bucket. The caller pulls their principal back from both
-//     (capital-protected; sized off-chain to what the market can currently
-//     cover, so a lossy market yields a pro-rata partial exit) and is paid the
-//     recovered amount. Any unrecovered principal stays claimable later.
-fn process_genesis_bootstrap_withdraw<'a>(
+// One permissionless withdraw for every phase; it always forfeits the vote
+// (start_slot -> 0). Withdrawals are locked only during voting (COIN live but
+// genesis not finalized), so a vote counts only if held through finalization.
+// By phase:
+//   - Before kickstart: capital is still in the genesis vault; refund the full
+//     remaining principal and shrink the pool. (pulls must be 0)
+//   - After kickstart, before voting: capital is deployed 50/50 into the
+//     market's insurance fund + backing bucket. The caller pulls their principal
+//     back from both (capital-protected; sized off-chain, so a lossy market
+//     yields a pro-rata partial exit) and is paid the recovered amount.
+//   - After finalization: pay the remaining principal pro-rata against the
+//     recovered vault balance. (pulls must be 0; unpaid principal stays claimable)
+fn process_genesis_withdraw<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &mut &[u8],
@@ -1986,14 +1871,11 @@ fn process_genesis_bootstrap_withdraw<'a>(
     verify_token_program(token_program)?;
     let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
     let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
-    // Exit is only open before voting starts. Voting requires the COIN to be
-    // live, so the window is the whole pre-live bootstrap phase.
-    if coin_cfg.is_live() {
-        msg!("genesis exit closes once voting starts");
-        return Err(ProgramError::InvalidInstructionData);
-    }
     let mut cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
-    if cfg.is_finalized() {
+    // Withdrawals are locked only during voting (COIN live but genesis not yet
+    // finalized), so a vote counts only if held through finalization.
+    if coin_cfg.is_live() && !cfg.is_finalized() {
+        msg!("withdrawals are locked during voting");
         return Err(ProgramError::InvalidInstructionData);
     }
     verify_genesis_vault(genesis_vault, &cfg, market_admin.key, program_id)?;
@@ -2057,6 +1939,49 @@ fn process_genesis_bootstrap_withdraw<'a>(
             }
             cfg.total_deposited = cfg.total_deposited.saturating_sub(actual);
             pos.amount = pos.amount.saturating_sub(actual);
+        }
+    } else if cfg.is_finalized() {
+        // Post-finalization: futarchy has recovered market funds into the vault;
+        // pay the remaining principal pro-rata against the vault balance, leaving
+        // any unpaid principal claimable on a later call.
+        if insurance_pull != 0 || backing_pull != 0 || iter.next().is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if remaining > 0 {
+            let outstanding = cfg.outstanding_principal();
+            if outstanding == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let vault_balance = load_token_account(genesis_vault)?.amount;
+            let actual = genesis_recoverable_principal(remaining, vault_balance, outstanding)?;
+            if actual > 0 {
+                let xfer_ix = spl_token::instruction::transfer(
+                    token_program.key,
+                    genesis_vault.key,
+                    user_base_ata.key,
+                    market_admin.key,
+                    &[],
+                    actual,
+                )?;
+                invoke_signed(
+                    &xfer_ix,
+                    &[
+                        genesis_vault.clone(),
+                        user_base_ata.clone(),
+                        market_admin.clone(),
+                        token_program.clone(),
+                    ],
+                    &[&signer_seeds],
+                )?;
+            }
+            cfg.total_withdrawn = cfg
+                .total_withdrawn
+                .checked_add(actual)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            pos.withdrawn = pos
+                .withdrawn
+                .checked_add(actual)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     } else {
         // Capital is deployed in the market: pull the depositor's principal back

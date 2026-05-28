@@ -373,7 +373,8 @@ fn encode_genesis_deposit(amount: u64) -> Vec<u8> {
 }
 
 fn encode_genesis_withdraw() -> Vec<u8> {
-    vec![23u8]
+    // Unified withdraw (tag 23); finalized/pre-kickstart phases take no pulls.
+    encode_genesis_bootstrap_withdraw(0, 0, 0)
 }
 
 fn encode_governance_init_genesis_bootstrap(reward_supply: u64) -> Vec<u8> {
@@ -1188,9 +1189,10 @@ impl TestEnv {
             program_id: self.rewards_id,
             accounts: vec![
                 AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(self.coin_cfg_pda(), false),
                 AccountMeta::new(self.genesis_cfg_pda(), false),
                 AccountMeta::new(self.genesis_position_pda(&user.pubkey()), false),
-                AccountMeta::new_readonly(self.coin_mint, false),
                 AccountMeta::new(user_ata, false),
                 AccountMeta::new(self.genesis_vault_pda(), false),
                 AccountMeta::new_readonly(self.market_admin_pda(), false),
@@ -3365,7 +3367,7 @@ fn encode_genesis_bootstrap_withdraw(
     insurance_pull: u64,
     backing_pull: u64,
 ) -> Vec<u8> {
-    let mut d = vec![34u8, backing_domain];
+    let mut d = vec![23u8, backing_domain];
     d.extend_from_slice(&insurance_pull.to_le_bytes());
     d.extend_from_slice(&backing_pull.to_le_bytes());
     d

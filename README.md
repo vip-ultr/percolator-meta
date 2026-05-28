@@ -6,6 +6,10 @@ Depositing capital is purely a Sybil check, not an investment. Participants put 
 
 The winning COIN distribution becomes the **MetaDAO**: the new COIN is its token, and it inherits the program's keys (via the Squads handover) along with any surplus.
 
+## ⚠️ Status & Disclaimer
+
+Experimental, **educational-use-only** software, provided **AS IS** with no warranties or conditions of any kind (see [LICENSE](LICENSE)). This is research/educational code, not financial advice and not a guarantee of correctness or fitness for any purpose. Genesis participants put real capital **at risk** in a live market and can lose it — the deposit is a Sybil-resistance bond, not an investment. Use at your own risk.
+
 ## Genesis Plan
 
 1. MetaDAO initializes `CoinConfig` with a configurable bootstrap delay in slots. A zero delay is live immediately; the intended launch setting can be a six-month slot delay.
@@ -112,3 +116,7 @@ Control transfers to the winning genesis DAO by rotating that `config_authority`
 | `BuilderApproval` | `[b"builder_approval", coin_mint, builder_program, code_hash]` |
 | Squads create-key | `[b"genesis_squads", coin_mint]` (this program) |
 | Squads multisig | `[b"multisig", b"multisig", create_key]` (Squads v4) |
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). Provided "as is", educational use only — see the disclaimer above.

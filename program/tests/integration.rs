@@ -2234,7 +2234,7 @@ fn test_genesis_distribution_and_finalize_require_market_kickstart() {
 }
 
 #[test]
-fn test_underfunded_genesis_withdrawal_keeps_unpaid_principal_claim() {
+fn test_underfunded_genesis_haircut_is_order_independent_and_loop_proof() {
     let mut env = TestEnv::new_meta_only();
     env.init_coin_config_with_delay(1);
     env.init_genesis_bootstrap(100);
@@ -2257,40 +2257,48 @@ fn test_underfunded_genesis_withdrawal_keeps_unpaid_principal_claim() {
     env.force_genesis_kicked_for_test();
     env.finalize_genesis();
 
+    // The market lost half the pooled capital: vault holds 2 against 4 of
+    // outstanding principal (a 50% health ratio).
     let genesis_vault = env.genesis_vault_pda();
     env.set_token_balance_for_test(&genesis_vault, 2);
-    let alice_first = env.genesis_withdraw(&alice);
-    assert_eq!(env.read_token_balance(&alice_first), 1);
+
+    // Alice withdraws FIRST and gets her 50% pro-rata share. The full claim is
+    // settled at the health ratio: pos.withdrawn becomes the whole 2 (the unpaid
+    // half is her realized share of the loss), not just the 1 token paid.
+    let alice_base = env.genesis_withdraw(&alice);
+    assert_eq!(
+        env.read_token_balance(&alice_base),
+        1,
+        "alice recovers her 50% pro-rata share"
+    );
     let alice_pos = env
         .svm
         .get_account(&env.genesis_position_pda(&alice.pubkey()))
         .unwrap();
     assert_eq!(
         u64::from_le_bytes(alice_pos.data[48..56].try_into().unwrap()),
-        1,
-        "only actually paid principal is retired"
+        2,
+        "the full claim is settled at the health ratio; the unpaid half is realized as loss"
     );
+
+    // Looping pays nothing more — the claim is settled, so the withdrawal race is
+    // dead (under the old live pro-rata, repeated calls drained the shared vault).
+    let alice_again = env.genesis_withdraw(&alice);
     assert_eq!(
-        u64::from_le_bytes(alice_pos.data[56..64].try_into().unwrap()),
+        env.read_token_balance(&alice_again),
         0,
-        "underfunded withdrawals still burn the vote weight"
+        "re-withdrawing yields nothing: no loop-amplified extraction"
     );
 
-    env.set_token_balance_for_test(&genesis_vault, 3);
-    let alice_second = env.genesis_withdraw(&alice);
-    assert_eq!(env.read_token_balance(&alice_second), 1);
-
-    let collateral_mint = env.collateral_mint;
-    let dao_base = env.create_ata(&collateral_mint, &env.dao_authority.pubkey(), 0);
-    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
-    let surplus_before_bob = env.try_draw_genesis_surplus_with_signer(&dao, 1, &dao_base);
-    assert!(
-        surplus_before_bob.is_err(),
-        "later topups remain reserved for unpaid genesis principal before DAO surplus"
-    );
-
+    // Bob, withdrawing SECOND, recovers the SAME fair 50% share — settling alice's
+    // full claim kept the health ratio invariant. (Under the old code bob, going
+    // second against the depleted vault, would have recovered 0.)
     let bob_base = env.genesis_withdraw(&bob);
-    assert_eq!(env.read_token_balance(&bob_base), 2);
+    assert_eq!(
+        env.read_token_balance(&bob_base),
+        1,
+        "bob (second) recovers the same 50% share, not a degraded one"
+    );
 }
 
 #[test]

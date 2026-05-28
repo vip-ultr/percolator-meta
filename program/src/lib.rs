@@ -1942,8 +1942,12 @@ fn process_genesis_withdraw<'a>(
         }
     } else if cfg.is_finalized() {
         // Post-finalization: futarchy has recovered market funds into the vault;
-        // pay the remaining principal pro-rata against the vault balance, leaving
-        // any unpaid principal claimable on a later call.
+        // pay the remaining principal pro-rata against the vault's health ratio
+        // and settle the FULL claim. Retiring the whole `remaining` (not just the
+        // paid `actual`) keeps the health ratio vault/outstanding invariant, so
+        // every depositor recovers the same share regardless of withdrawal order
+        // and looping pays nothing. The unpaid shortfall is this depositor's
+        // realized share of the market loss.
         if insurance_pull != 0 || backing_pull != 0 || iter.next().is_some() {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -1976,11 +1980,11 @@ fn process_genesis_withdraw<'a>(
             }
             cfg.total_withdrawn = cfg
                 .total_withdrawn
-                .checked_add(actual)
+                .checked_add(remaining)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
             pos.withdrawn = pos
                 .withdrawn
-                .checked_add(actual)
+                .checked_add(remaining)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     } else {

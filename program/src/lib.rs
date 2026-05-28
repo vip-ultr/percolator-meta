@@ -41,12 +41,8 @@ mod percolator_abi {
     const MAGIC: u64 = 0x5045_5243_5631_3600; // "PERCV16\0"
     const VERSION: u16 = 16;
     const KIND_MARKET: u8 = 1;
-    const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
-    const KIND_INSURANCE_LEDGER: u8 = 4;
     const HEADER_LEN: usize = 16;
     const WRAPPER_CONFIG_LEN: usize = 624;
-    pub const BACKING_DOMAIN_LEDGER_ACCOUNT_LEN: usize = HEADER_LEN + 224;
-    pub const INSURANCE_LEDGER_ACCOUNT_LEN: usize = HEADER_LEN + 160;
     const CFG_ADMIN_OFF: usize = HEADER_LEN;
     const CFG_COLLATERAL_MINT_OFF: usize = HEADER_LEN + 32;
     const CFG_SECONDARY_COLLATERAL_MINT_OFF: usize = HEADER_LEN + 64;
@@ -63,21 +59,6 @@ mod percolator_abi {
         pub backing_bucket_authority: [u8; 32],
     }
 
-    pub struct InsuranceLedger {
-        pub market_group: [u8; 32],
-        pub authority: [u8; 32],
-        pub cumulative_loss_atoms: u128,
-    }
-
-    pub struct BackingDomainLedger {
-        pub market_group: [u8; 32],
-        pub authority: [u8; 32],
-        pub total_earnings_atoms: u128,
-        pub cumulative_loss_atoms: u128,
-        pub cumulative_recovery_atoms: u128,
-        pub domain: u16,
-    }
-
     fn read_u16(data: &[u8], off: usize) -> Result<u16, ProgramError> {
         let bytes = data
             .get(off..off + 2)
@@ -85,15 +66,6 @@ mod percolator_abi {
             .try_into()
             .map_err(|_| ProgramError::InvalidAccountData)?;
         Ok(u16::from_le_bytes(bytes))
-    }
-
-    fn read_u128(data: &[u8], off: usize) -> Result<u128, ProgramError> {
-        let bytes = data
-            .get(off..off + 16)
-            .ok_or(ProgramError::InvalidAccountData)?
-            .try_into()
-            .map_err(|_| ProgramError::InvalidAccountData)?;
-        Ok(u128::from_le_bytes(bytes))
     }
 
     fn read_u64(data: &[u8], off: usize) -> Result<u64, ProgramError> {
@@ -143,56 +115,13 @@ mod percolator_abi {
         }
         Ok(config)
     }
-
-    pub fn read_insurance_ledger(data: &[u8]) -> Result<InsuranceLedger, ProgramError> {
-        check_header(data, KIND_INSURANCE_LEDGER, INSURANCE_LEDGER_ACCOUNT_LEN)?;
-        let ledger = InsuranceLedger {
-            market_group: read_pubkey_bytes(data, HEADER_LEN)?,
-            authority: read_pubkey_bytes(data, HEADER_LEN + 32)?,
-            cumulative_loss_atoms: read_u128(data, HEADER_LEN + 128)?,
-        };
-        if ledger.market_group == [0u8; 32] || ledger.authority == [0u8; 32] {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Ok(ledger)
-    }
-
-    pub fn read_backing_domain_ledger(data: &[u8]) -> Result<BackingDomainLedger, ProgramError> {
-        check_header(
-            data,
-            KIND_BACKING_DOMAIN_LEDGER,
-            BACKING_DOMAIN_LEDGER_ACCOUNT_LEN,
-        )?;
-        let ledger = BackingDomainLedger {
-            market_group: read_pubkey_bytes(data, HEADER_LEN)?,
-            authority: read_pubkey_bytes(data, HEADER_LEN + 32)?,
-            total_earnings_atoms: read_u128(data, HEADER_LEN + 112)?,
-            cumulative_loss_atoms: read_u128(data, HEADER_LEN + 160)?,
-            cumulative_recovery_atoms: read_u128(data, HEADER_LEN + 176)?,
-            domain: read_u16(data, HEADER_LEN + 208)?,
-        };
-        if ledger.market_group == [0u8; 32] || ledger.authority == [0u8; 32] {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Ok(ledger)
-    }
 }
-
-/// Fixed-point scale for reward math.
-pub const FP: u128 = 1u128 << 64;
 
 /// Instruction tags
 const IX_INIT_COIN_CONFIG: u8 = 3;
 const IX_MINT_REWARD: u8 = 8;
 const IX_TRANSFER_MINT_AUTHORITY: u8 = 10;
 const IX_ACTIVATE_LIVE: u8 = 11;
-const IX_INIT_RISK_VAULT: u8 = 12;
-const IX_REGISTER_RISK_VAULT_AUTHORITY: u8 = 13;
-const IX_RISK_DEPOSIT: u8 = 14;
-const IX_RISK_REQUEST_WITHDRAW: u8 = 15;
-const IX_RISK_WITHDRAW: u8 = 16;
-const IX_SYNC_RISK_VAULT: u8 = 17;
-const IX_RISK_CLAIM_REWARDS: u8 = 18;
 const IX_INIT_PERCOLATOR_MARKET: u8 = 19;
 const IX_PERCOLATOR_ADMIN: u8 = 20;
 const IX_INIT_GENESIS_BOOTSTRAP: u8 = 21;
@@ -214,6 +143,9 @@ const IX_GENESIS_BOOTSTRAP_WITHDRAW: u8 = 34;
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_RESOLVE_MARKET: u8 = 19;
+// Referenced only by the `futarchy_admin_proxy_is_lifecycle_scoped` unit test
+// (asserts UpdateAuthority is NOT in the admin-proxy allow-list).
+#[allow(dead_code)]
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_UPDATE_INSURANCE_POLICY: u8 = 33;
 const PERC_IX_CONFIGURE_HYBRID_ORACLE: u8 = 34;
@@ -228,8 +160,6 @@ const PERC_IX_TOP_UP_BACKING_BUCKET: u8 = 24;
 const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
 const PERC_IX_WITHDRAW_BACKING_BUCKET: u8 = 50;
 const PERC_IX_WITHDRAW_BACKING_BUCKET_EARNINGS: u8 = 52;
-const PERC_IX_SYNC_BACKING_DOMAIN_LEDGER: u8 = 53;
-const PERC_IX_SYNC_INSURANCE_LEDGER: u8 = 54;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_UPDATE_FEE_REDIRECT_POLICY: u8 = 58;
@@ -237,12 +167,6 @@ const PERC_IX_UPDATE_MARKET_INIT_FEE_POLICY: u8 = 59;
 const PERC_IX_UPDATE_BASE_UNIT_MINTS: u8 = 60;
 const PERC_IX_CONFIGURE_AUTH_MARK: u8 = 62;
 const PERC_IX_WITHDRAW_INSURANCE_DOMAIN: u8 = 57;
-const PERC_AUTHORITY_INSURANCE: u8 = 2;
-const PERC_AUTHORITY_BACKING_BUCKET: u8 = 3;
-const PERC_AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
-
-const RISK_KIND_INSURANCE: u8 = 0;
-const RISK_KIND_BACKING: u8 = 1;
 
 /// Genesis market insurance withdraw policy: 100% of deposited principal is
 /// recoverable (deposits_only caps to principal, never market profits).
@@ -260,25 +184,19 @@ const GENESIS_RECOVER_INSURANCE_DOMAIN: u8 = 4;
 
 /// CoinConfig: 8 + 32 + 8 + 8 + 8 + 1 + 7 = 72
 const COIN_CFG_SIZE: usize = 8 + 32 + 8 + 8 + 8 + 1 + 7;
-/// RiskVaultCfg: fixed-layout state for insurance/backing depositor accounting.
-const RISK_VAULT_SIZE: usize = 352;
-/// RiskPosition: fixed-layout state for a depositor in one RiskVaultCfg.
-const RISK_POSITION_SIZE: usize = 136;
 /// GenesisConfig: base-token bootstrap deposits, vote units, and fixed supply.
 const GENESIS_CFG_SIZE: usize = 184;
 /// GenesisPosition: per-user base-unit deposit and voting weight.
 const GENESIS_POSITION_SIZE: usize = 72;
 /// GenesisDistribution: vote-approved mint allocation item.
-const GENESIS_DISTRIBUTION_SIZE: usize = 112;
+const GENESIS_DISTRIBUTION_SIZE: usize = 120;
 /// GenesisDistributionVote: one voter's weight on one allocation item.
-const GENESIS_DISTRIBUTION_VOTE_SIZE: usize = 88;
+const GENESIS_DISTRIBUTION_VOTE_SIZE: usize = 96;
 /// BuilderApproval: governed registry entry for approved builder code.
 const BUILDER_APPROVAL_SIZE: usize = 152;
 
 // Discriminators
 const COIN_CFG_DISC: [u8; 8] = *b"CCFGV002";
-const RISK_VAULT_DISC: [u8; 8] = *b"RVLT0001";
-const RISK_POSITION_DISC: [u8; 8] = *b"RPOS0001";
 const GENESIS_CFG_DISC: [u8; 8] = *b"GENCFG01";
 const GENESIS_POSITION_DISC: [u8; 8] = *b"GENPOS01";
 const GENESIS_DISTRIBUTION_DISC: [u8; 8] = *b"GENDIST1";
@@ -393,22 +311,6 @@ fn builder_approval_seeds<'a>(
     ]
 }
 
-fn risk_vault_seeds<'a>(market_slab: &'a Pubkey, suffix: &'a [u8; 2]) -> [&'a [u8]; 3] {
-    [b"risk_vault", market_slab.as_ref(), suffix]
-}
-
-fn risk_token_vault_seeds<'a>(market_slab: &'a Pubkey, suffix: &'a [u8; 2]) -> [&'a [u8]; 3] {
-    [b"risk_token_vault", market_slab.as_ref(), suffix]
-}
-
-fn risk_ledger_seeds<'a>(market_slab: &'a Pubkey, suffix: &'a [u8; 2]) -> [&'a [u8]; 3] {
-    [b"risk_ledger", market_slab.as_ref(), suffix]
-}
-
-fn risk_position_seeds<'a>(risk_vault: &'a Pubkey, user: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"risk_position", risk_vault.as_ref(), user.as_ref()]
-}
-
 // ============================================================================
 // Instruction deserialization
 // ============================================================================
@@ -428,15 +330,6 @@ fn read_u64(data: &mut &[u8]) -> Result<u64, ProgramError> {
     }
     let val = u64::from_le_bytes(data[..8].try_into().unwrap());
     *data = &data[8..];
-    Ok(val)
-}
-
-fn read_u16(data: &mut &[u8]) -> Result<u16, ProgramError> {
-    if data.len() < 2 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let val = u16::from_le_bytes(data[..2].try_into().unwrap());
-    *data = &data[2..];
     Ok(val)
 }
 
@@ -510,166 +403,6 @@ impl CoinConfig {
 
     fn is_live(&self) -> bool {
         self.phase == PHASE_LIVE
-    }
-}
-
-// ============================================================================
-// RiskVaultCfg / RiskPosition — external risk depositor subledger state
-// ============================================================================
-
-struct RiskVaultCfg {
-    kind: u8,
-    domain: u8,
-    market_slab: Pubkey,
-    coin_mint: Pubkey,
-    collateral_mint: Pubkey,
-    token_vault: Pubkey,
-    engine_ledger: Pubkey,
-    lockup_slots: u64,
-    withdraw_delay_slots: u64,
-    total_deposited: u64,
-    total_withdrawn: u64,
-    total_shares: u64,
-    reward_per_share_stored: u128,
-    loss_per_share_stored: u128,
-    recovery_per_share_stored: u128,
-    last_reward_counter: u128,
-    last_loss_counter: u128,
-    last_recovery_counter: u128,
-    dao_fee_bps: u16,
-    fee_destination: Pubkey,
-}
-
-impl RiskVaultCfg {
-    fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < RISK_VAULT_SIZE {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        if data[..8] != RISK_VAULT_DISC {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let kind = data[8];
-        let domain = data[9];
-        validate_risk_kind(kind)?;
-        let market_slab = Pubkey::new_from_array(data[16..48].try_into().unwrap());
-        let coin_mint = Pubkey::new_from_array(data[48..80].try_into().unwrap());
-        let collateral_mint = Pubkey::new_from_array(data[80..112].try_into().unwrap());
-        let token_vault = Pubkey::new_from_array(data[112..144].try_into().unwrap());
-        let engine_ledger = Pubkey::new_from_array(data[144..176].try_into().unwrap());
-        let lockup_slots = u64::from_le_bytes(data[176..184].try_into().unwrap());
-        let withdraw_delay_slots = u64::from_le_bytes(data[184..192].try_into().unwrap());
-        let total_deposited = u64::from_le_bytes(data[192..200].try_into().unwrap());
-        let total_withdrawn = u64::from_le_bytes(data[200..208].try_into().unwrap());
-        let total_shares = u64::from_le_bytes(data[208..216].try_into().unwrap());
-        let reward_per_share_stored = u128::from_le_bytes(data[216..232].try_into().unwrap());
-        let loss_per_share_stored = u128::from_le_bytes(data[232..248].try_into().unwrap());
-        let recovery_per_share_stored = u128::from_le_bytes(data[248..264].try_into().unwrap());
-        let last_reward_counter = u128::from_le_bytes(data[264..280].try_into().unwrap());
-        let last_loss_counter = u128::from_le_bytes(data[280..296].try_into().unwrap());
-        let last_recovery_counter = u128::from_le_bytes(data[296..312].try_into().unwrap());
-        let dao_fee_bps = u16::from_le_bytes(data[312..314].try_into().unwrap());
-        let fee_destination = Pubkey::new_from_array(data[320..352].try_into().unwrap());
-        if dao_fee_bps > 10_000 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Ok(Self {
-            kind,
-            domain,
-            market_slab,
-            coin_mint,
-            collateral_mint,
-            token_vault,
-            engine_ledger,
-            lockup_slots,
-            withdraw_delay_slots,
-            total_deposited,
-            total_withdrawn,
-            total_shares,
-            reward_per_share_stored,
-            loss_per_share_stored,
-            recovery_per_share_stored,
-            last_reward_counter,
-            last_loss_counter,
-            last_recovery_counter,
-            dao_fee_bps,
-            fee_destination,
-        })
-    }
-
-    fn serialize(&self, data: &mut [u8]) {
-        data[..8].copy_from_slice(&RISK_VAULT_DISC);
-        data[8] = self.kind;
-        data[9] = self.domain;
-        data[10..16].fill(0);
-        data[16..48].copy_from_slice(self.market_slab.as_ref());
-        data[48..80].copy_from_slice(self.coin_mint.as_ref());
-        data[80..112].copy_from_slice(self.collateral_mint.as_ref());
-        data[112..144].copy_from_slice(self.token_vault.as_ref());
-        data[144..176].copy_from_slice(self.engine_ledger.as_ref());
-        data[176..184].copy_from_slice(&self.lockup_slots.to_le_bytes());
-        data[184..192].copy_from_slice(&self.withdraw_delay_slots.to_le_bytes());
-        data[192..200].copy_from_slice(&self.total_deposited.to_le_bytes());
-        data[200..208].copy_from_slice(&self.total_withdrawn.to_le_bytes());
-        data[208..216].copy_from_slice(&self.total_shares.to_le_bytes());
-        data[216..232].copy_from_slice(&self.reward_per_share_stored.to_le_bytes());
-        data[232..248].copy_from_slice(&self.loss_per_share_stored.to_le_bytes());
-        data[248..264].copy_from_slice(&self.recovery_per_share_stored.to_le_bytes());
-        data[264..280].copy_from_slice(&self.last_reward_counter.to_le_bytes());
-        data[280..296].copy_from_slice(&self.last_loss_counter.to_le_bytes());
-        data[296..312].copy_from_slice(&self.last_recovery_counter.to_le_bytes());
-        data[312..314].copy_from_slice(&self.dao_fee_bps.to_le_bytes());
-        data[314..320].fill(0);
-        data[320..352].copy_from_slice(self.fee_destination.as_ref());
-    }
-}
-
-struct RiskPosition {
-    owner: Pubkey,
-    shares: u64,
-    deposit_slot: u64,
-    pending_withdraw_shares: u64,
-    withdraw_request_slot: u64,
-    reward_per_share_paid: u128,
-    loss_per_share_paid: u128,
-    recovery_per_share_paid: u128,
-    pending_rewards: u64,
-    pending_losses: u64,
-}
-
-impl RiskPosition {
-    fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < RISK_POSITION_SIZE {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        if data[..8] != RISK_POSITION_DISC {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Ok(Self {
-            owner: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
-            shares: u64::from_le_bytes(data[40..48].try_into().unwrap()),
-            deposit_slot: u64::from_le_bytes(data[48..56].try_into().unwrap()),
-            pending_withdraw_shares: u64::from_le_bytes(data[56..64].try_into().unwrap()),
-            withdraw_request_slot: u64::from_le_bytes(data[64..72].try_into().unwrap()),
-            reward_per_share_paid: u128::from_le_bytes(data[72..88].try_into().unwrap()),
-            loss_per_share_paid: u128::from_le_bytes(data[88..104].try_into().unwrap()),
-            recovery_per_share_paid: u128::from_le_bytes(data[104..120].try_into().unwrap()),
-            pending_rewards: u64::from_le_bytes(data[120..128].try_into().unwrap()),
-            pending_losses: u64::from_le_bytes(data[128..136].try_into().unwrap()),
-        })
-    }
-
-    fn serialize(&self, data: &mut [u8]) {
-        data[..8].copy_from_slice(&RISK_POSITION_DISC);
-        data[8..40].copy_from_slice(self.owner.as_ref());
-        data[40..48].copy_from_slice(&self.shares.to_le_bytes());
-        data[48..56].copy_from_slice(&self.deposit_slot.to_le_bytes());
-        data[56..64].copy_from_slice(&self.pending_withdraw_shares.to_le_bytes());
-        data[64..72].copy_from_slice(&self.withdraw_request_slot.to_le_bytes());
-        data[72..88].copy_from_slice(&self.reward_per_share_paid.to_le_bytes());
-        data[88..104].copy_from_slice(&self.loss_per_share_paid.to_le_bytes());
-        data[104..120].copy_from_slice(&self.recovery_per_share_paid.to_le_bytes());
-        data[120..128].copy_from_slice(&self.pending_rewards.to_le_bytes());
-        data[128..136].copy_from_slice(&self.pending_losses.to_le_bytes());
     }
 }
 
@@ -752,8 +485,10 @@ struct GenesisPosition {
     owner: Pubkey,
     amount: u64,
     withdrawn: u64,
-    vote_units: u64,
-    allocated_vote_units: u64,
+    /// Slot of the depositor's most recent deposit (last-write-time). Vote weight
+    /// is `floor(log2(vote_slot - start_slot)) * staked`. Cleared to 0 on exit.
+    start_slot: u64,
+    reserved: u64,
 }
 
 impl GenesisPosition {
@@ -765,8 +500,8 @@ impl GenesisPosition {
             owner: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
             amount: u64::from_le_bytes(data[40..48].try_into().unwrap()),
             withdrawn: u64::from_le_bytes(data[48..56].try_into().unwrap()),
-            vote_units: u64::from_le_bytes(data[56..64].try_into().unwrap()),
-            allocated_vote_units: u64::from_le_bytes(data[64..72].try_into().unwrap()),
+            start_slot: u64::from_le_bytes(data[56..64].try_into().unwrap()),
+            reserved: u64::from_le_bytes(data[64..72].try_into().unwrap()),
         })
     }
 
@@ -775,9 +510,23 @@ impl GenesisPosition {
         data[8..40].copy_from_slice(self.owner.as_ref());
         data[40..48].copy_from_slice(&self.amount.to_le_bytes());
         data[48..56].copy_from_slice(&self.withdrawn.to_le_bytes());
-        data[56..64].copy_from_slice(&self.vote_units.to_le_bytes());
-        data[64..72].copy_from_slice(&self.allocated_vote_units.to_le_bytes());
+        data[56..64].copy_from_slice(&self.start_slot.to_le_bytes());
+        data[64..72].copy_from_slice(&self.reserved.to_le_bytes());
     }
+
+    fn staked(&self) -> u64 {
+        self.amount.saturating_sub(self.withdrawn)
+    }
+}
+
+/// Time-weighted vote power: `floor(log2(age)) * staked`, where `age` is the
+/// position's age in slots at vote time. Younger than 2 slots (log2 == 0) has no
+/// weight, so there is monotonic pressure to deposit earlier.
+fn genesis_vote_weight(staked: u64, age: u64) -> u64 {
+    if staked == 0 || age < 2 {
+        return 0;
+    }
+    (age.ilog2() as u64).saturating_mul(staked)
 }
 
 struct GenesisDistribution {
@@ -785,9 +534,13 @@ struct GenesisDistribution {
     destination: Pubkey,
     proposal_id: u64,
     amount: u64,
+    /// Log-weighted yes/no totals (sum of `floor(log2(age)) * staked`).
     yes_votes: u64,
     no_votes: u64,
     executed: u8,
+    /// Raw staked principal of every distinct participant (yes or no). Used for
+    /// the quorum check, independent of the log weighting.
+    voted_principal: u64,
 }
 
 impl GenesisDistribution {
@@ -807,6 +560,7 @@ impl GenesisDistribution {
             yes_votes: u64::from_le_bytes(data[88..96].try_into().unwrap()),
             no_votes: u64::from_le_bytes(data[96..104].try_into().unwrap()),
             executed,
+            voted_principal: u64::from_le_bytes(data[112..120].try_into().unwrap()),
         })
     }
 
@@ -819,7 +573,8 @@ impl GenesisDistribution {
         data[88..96].copy_from_slice(&self.yes_votes.to_le_bytes());
         data[96..104].copy_from_slice(&self.no_votes.to_le_bytes());
         data[104] = self.executed;
-        data[105..GENESIS_DISTRIBUTION_SIZE].fill(0);
+        data[105..112].fill(0);
+        data[112..120].copy_from_slice(&self.voted_principal.to_le_bytes());
     }
 
     fn is_executed(&self) -> bool {
@@ -830,8 +585,11 @@ impl GenesisDistribution {
 struct GenesisDistributionVote {
     proposal: Pubkey,
     voter: Pubkey,
+    /// Log-weighted power this voter last contributed to the tally.
     weight: u64,
     support: u8,
+    /// Raw staked principal counted once toward the proposal's quorum.
+    principal: u64,
 }
 
 impl GenesisDistributionVote {
@@ -850,6 +608,7 @@ impl GenesisDistributionVote {
             voter: Pubkey::new_from_array(data[40..72].try_into().unwrap()),
             weight: u64::from_le_bytes(data[72..80].try_into().unwrap()),
             support,
+            principal: u64::from_le_bytes(data[88..96].try_into().unwrap()),
         })
     }
 
@@ -859,7 +618,8 @@ impl GenesisDistributionVote {
         data[40..72].copy_from_slice(self.voter.as_ref());
         data[72..80].copy_from_slice(&self.weight.to_le_bytes());
         data[80] = self.support;
-        data[81..GENESIS_DISTRIBUTION_VOTE_SIZE].fill(0);
+        data[81..88].fill(0);
+        data[88..96].copy_from_slice(&self.principal.to_le_bytes());
     }
 }
 
@@ -949,159 +709,6 @@ fn create_pda_account_with_owner<'a>(
         &[payer.clone(), target.clone(), system_program.clone()],
         &[&seeds_with_bump],
     )
-}
-
-fn validate_risk_kind(kind: u8) -> ProgramResult {
-    match kind {
-        RISK_KIND_INSURANCE | RISK_KIND_BACKING => Ok(()),
-        _ => Err(ProgramError::InvalidInstructionData),
-    }
-}
-
-fn risk_suffix(kind: u8, domain: u8) -> Result<[u8; 2], ProgramError> {
-    validate_risk_kind(kind)?;
-    if kind == RISK_KIND_INSURANCE && domain != 0 {
-        msg!("main insurance risk vault must use domain 0");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    Ok([kind, domain])
-}
-
-fn verify_risk_vault_pda(
-    risk_vault_account: &AccountInfo,
-    cfg: &RiskVaultCfg,
-    program_id: &Pubkey,
-) -> Result<u8, ProgramError> {
-    if risk_vault_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let seeds = risk_vault_seeds(&cfg.market_slab, &suffix);
-    let (expected, bump) = Pubkey::find_program_address(&seeds, program_id);
-    if *risk_vault_account.key != expected {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    Ok(bump)
-}
-
-fn verify_risk_cfg_accounts<'a>(
-    program_id: &Pubkey,
-    cfg: &RiskVaultCfg,
-    risk_vault_account: &AccountInfo<'a>,
-    market_slab: &AccountInfo<'a>,
-    token_vault: &AccountInfo<'a>,
-    engine_ledger: &AccountInfo<'a>,
-    token_program: &AccountInfo<'a>,
-) -> Result<u8, ProgramError> {
-    let bump = verify_risk_vault_pda(risk_vault_account, cfg, program_id)?;
-    if *market_slab.key != cfg.market_slab || *token_vault.key != cfg.token_vault {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    if *engine_ledger.key != cfg.engine_ledger {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    verify_token_program(token_program)?;
-    validate_token_account(token_vault, &cfg.collateral_mint, risk_vault_account.key)?;
-    if market_slab.owner != &percolator_abi::id() {
-        return Err(ProgramError::IllegalOwner);
-    }
-    if engine_ledger.owner != &percolator_abi::id() {
-        return Err(ProgramError::IllegalOwner);
-    }
-    Ok(bump)
-}
-
-fn risk_position_for_user<'a>(
-    program_id: &Pubkey,
-    user: &AccountInfo<'a>,
-    risk_vault_account: &AccountInfo<'a>,
-    position_account: &AccountInfo<'a>,
-    system_program: Option<&AccountInfo<'a>>,
-) -> Result<RiskPosition, ProgramError> {
-    let seeds = risk_position_seeds(risk_vault_account.key, user.key);
-    let (expected_position, _) = Pubkey::find_program_address(&seeds, program_id);
-    if *position_account.key != expected_position {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    if position_account.data_len() == 0 || position_account.lamports() == 0 {
-        let system_program = system_program.ok_or(ProgramError::InvalidAccountData)?;
-        create_pda_account(
-            user,
-            position_account,
-            system_program,
-            program_id,
-            &seeds,
-            RISK_POSITION_SIZE,
-        )?;
-        return Ok(RiskPosition {
-            owner: *user.key,
-            shares: 0,
-            deposit_slot: 0,
-            pending_withdraw_shares: 0,
-            withdraw_request_slot: 0,
-            reward_per_share_paid: 0,
-            loss_per_share_paid: 0,
-            recovery_per_share_paid: 0,
-            pending_rewards: 0,
-            pending_losses: 0,
-        });
-    }
-    if position_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let data = position_account.try_borrow_data()?;
-    let pos = RiskPosition::deserialize(&data)?;
-    if pos.owner != *user.key {
-        return Err(ProgramError::IllegalOwner);
-    }
-    Ok(pos)
-}
-
-fn checked_add_per_share(accumulator: &mut u128, amount: u128, total_shares: u64) -> ProgramResult {
-    if amount == 0 || total_shares == 0 {
-        return Ok(());
-    }
-    let (lo, hi) = mul_u128_wide(amount, FP);
-    let delta = div_u256_by_u128(lo, hi, total_shares as u128);
-    *accumulator = accumulator
-        .checked_add(delta)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    Ok(())
-}
-
-fn fp_mul_to_u64(amount: u64, per_share_delta: u128) -> u64 {
-    let (lo, hi) = mul_u128_wide(amount as u128, per_share_delta);
-    let value = (lo >> 64) | (hi << 64);
-    core::cmp::min(value, u64::MAX as u128) as u64
-}
-
-fn settle_risk_position(pos: &mut RiskPosition, cfg: &RiskVaultCfg) {
-    if pos.shares != 0 {
-        let reward_delta = cfg
-            .reward_per_share_stored
-            .saturating_sub(pos.reward_per_share_paid);
-        let loss_delta = cfg
-            .loss_per_share_stored
-            .saturating_sub(pos.loss_per_share_paid);
-        let recovery_delta = cfg
-            .recovery_per_share_stored
-            .saturating_sub(pos.recovery_per_share_paid);
-        let earned = fp_mul_to_u64(pos.shares, reward_delta);
-        let lost = fp_mul_to_u64(pos.shares, loss_delta);
-        let recovered = fp_mul_to_u64(pos.shares, recovery_delta);
-        pos.pending_rewards = pos.pending_rewards.saturating_add(earned);
-        pos.pending_losses = core::cmp::min(pos.shares, pos.pending_losses.saturating_add(lost));
-        pos.pending_losses = pos.pending_losses.saturating_sub(recovered);
-    }
-    pos.reward_per_share_paid = cfg.reward_per_share_stored;
-    pos.loss_per_share_paid = cfg.loss_per_share_stored;
-    pos.recovery_per_share_paid = cfg.recovery_per_share_stored;
-}
-
-fn available_risk_shares(pos: &RiskPosition) -> u64 {
-    pos.shares
-        .saturating_sub(pos.pending_losses)
-        .saturating_sub(pos.pending_withdraw_shares)
 }
 
 fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
@@ -1442,15 +1049,6 @@ pub fn process_instruction<'a>(
         IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
         IX_TRANSFER_MINT_AUTHORITY => process_transfer_mint_authority(program_id, accounts),
         IX_ACTIVATE_LIVE => process_activate_live(program_id, accounts, &mut data),
-        IX_INIT_RISK_VAULT => process_init_risk_vault(program_id, accounts, &mut data),
-        IX_REGISTER_RISK_VAULT_AUTHORITY => {
-            process_register_risk_vault_authority(program_id, accounts, &mut data)
-        }
-        IX_RISK_DEPOSIT => process_risk_deposit(program_id, accounts, &mut data),
-        IX_RISK_REQUEST_WITHDRAW => process_risk_request_withdraw(program_id, accounts, &mut data),
-        IX_RISK_WITHDRAW => process_risk_withdraw(program_id, accounts, &mut data),
-        IX_SYNC_RISK_VAULT => process_sync_risk_vault(program_id, accounts),
-        IX_RISK_CLAIM_REWARDS => process_risk_claim_rewards(program_id, accounts, &mut data),
         IX_INIT_PERCOLATOR_MARKET => process_init_percolator_market(program_id, accounts, &data),
         IX_PERCOLATOR_ADMIN => process_percolator_admin(program_id, accounts, &data),
         IX_INIT_GENESIS_BOOTSTRAP => {
@@ -2116,10 +1714,16 @@ fn process_genesis_deposit<'a>(
     }
     verify_token_program(token_program)?;
     let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
+    // Joining is open any time during the pre-deployment deposit phase — no fixed
+    // window — but closes once the pooled principal is deployed at kickstart. This
+    // keeps the invariant that every base unit is either in the genesis vault
+    // (pre-kickstart) or in the market (post-kickstart), never split, so a
+    // depositor's bootstrap exit always draws from the right place.
     if coin_cfg.is_live() {
-        msg!("genesis deposits are closed after bootstrap");
+        msg!("genesis deposits close once voting starts");
         return Err(ProgramError::InvalidInstructionData);
     }
+    let clock = Clock::get()?;
 
     let mut genesis_cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     let mut genesis_cfg = GenesisConfig::deserialize(&genesis_cfg_data)?;
@@ -2130,12 +1734,7 @@ fn process_genesis_deposit<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
     if genesis_cfg.is_finalized() || genesis_cfg.is_kicked() {
-        msg!("genesis deposits are closed");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let clock = Clock::get()?;
-    if clock.slot >= genesis_cfg.deposit_end_slot {
-        msg!("genesis deposit window is closed");
+        msg!("genesis deposits close once the pooled capital is deployed at kickstart");
         return Err(ProgramError::InvalidInstructionData);
     }
     let (market_admin, _) =
@@ -2161,8 +1760,8 @@ fn process_genesis_deposit<'a>(
             owner: *user.key,
             amount: 0,
             withdrawn: 0,
-            vote_units: 0,
-            allocated_vote_units: 0,
+            start_slot: 0,
+            reserved: 0,
         }
     } else {
         if genesis_position.owner != program_id {
@@ -2210,10 +1809,8 @@ fn process_genesis_deposit<'a>(
         .amount
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.vote_units = pos
-        .vote_units
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Last-write-time: each deposit resets the clock used for vote weighting.
+    pos.start_slot = clock.slot;
 
     genesis_cfg.serialize(&mut genesis_cfg_data);
     let mut pos_data = genesis_position.try_borrow_mut_data()?;
@@ -2297,8 +1894,8 @@ fn process_genesis_withdraw<'a>(
         .withdrawn
         .checked_add(actual)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.vote_units = 0;
-    pos.allocated_vote_units = 0;
+    pos.start_slot = 0;
+    pos.reserved = 0;
     let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
     let mut pos_data = genesis_position.try_borrow_mut_data()?;
@@ -2613,8 +2210,8 @@ fn process_genesis_bootstrap_withdraw<'a>(
     }
 
     // The exit forfeits all voting power regardless of how much was recovered.
-    pos.vote_units = 0;
-    pos.allocated_vote_units = 0;
+    pos.start_slot = 0;
+    pos.reserved = 0;
 
     let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
@@ -2714,6 +2311,7 @@ fn process_init_genesis_distribution<'a>(
         yes_votes: 0,
         no_votes: 0,
         executed: 0,
+        voted_principal: 0,
     };
     let mut proposal_data = distribution_account.try_borrow_mut_data()?;
     proposal.serialize(&mut proposal_data);
@@ -2770,12 +2368,25 @@ fn process_vote_genesis_distribution<'a>(
     {
         return Err(ProgramError::InvalidSeeds);
     }
+    let current_slot = Clock::get()?.slot;
     let pos_data = genesis_position.try_borrow_data()?;
     let pos = GenesisPosition::deserialize(&pos_data)?;
-    if pos.owner != *voter.key || pos.vote_units == 0 {
+    if pos.owner != *voter.key {
         return Err(ProgramError::InvalidAccountData);
     }
+    let staked = pos.staked();
+    // Time-weighted power at vote time: floor(log2(age)) * staked. A cleared
+    // start slot (exited) or a too-young/empty position has no power.
+    let weight = if pos.start_slot == 0 {
+        0
+    } else {
+        genesis_vote_weight(staked, current_slot.saturating_sub(pos.start_slot))
+    };
     drop(pos_data);
+    if weight == 0 {
+        msg!("position has no vote weight (exited, unfunded, or deposited too late)");
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     if distribution_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
@@ -2813,7 +2424,8 @@ fn process_vote_genesis_distribution<'a>(
         Some(vote)
     };
 
-    if let Some(old_vote) = vote {
+    // Back out this voter's previous weighted contribution, if any.
+    if let Some(old_vote) = &vote {
         if old_vote.support == 1 {
             proposal.yes_votes = proposal
                 .yes_votes
@@ -2826,23 +2438,34 @@ fn process_vote_genesis_distribution<'a>(
                 .ok_or(ProgramError::InvalidAccountData)?;
         }
     }
+    // Quorum principal counts each distinct voter's staked principal once.
+    // (Staked is frozen during voting, so a re-vote nets to no change.)
+    let prev_principal = vote.as_ref().map(|v| v.principal).unwrap_or(0);
+    proposal.voted_principal = proposal
+        .voted_principal
+        .checked_sub(prev_principal)
+        .ok_or(ProgramError::InvalidAccountData)?
+        .checked_add(staked)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Add the new contribution at the current time-weighted power.
     if support == 1 {
         proposal.yes_votes = proposal
             .yes_votes
-            .checked_add(pos.vote_units)
+            .checked_add(weight)
             .ok_or(ProgramError::ArithmeticOverflow)?;
     } else {
         proposal.no_votes = proposal
             .no_votes
-            .checked_add(pos.vote_units)
+            .checked_add(weight)
             .ok_or(ProgramError::ArithmeticOverflow)?;
     }
 
     let new_vote = GenesisDistributionVote {
         proposal: *distribution_account.key,
         voter: *voter.key,
-        weight: pos.vote_units,
+        weight,
         support,
+        principal: staked,
     };
     proposal.serialize(&mut proposal_data);
     let mut vote_data = vote_account.try_borrow_mut_data()?;
@@ -2906,8 +2529,14 @@ fn process_genesis_mint_reward<'a>(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    if proposal.yes_votes <= cfg.total_deposited / 2 {
-        msg!("genesis distribution proposal lacks majority approval");
+    // Approval: a log-weighted majority of cast votes, gated by a quorum of the
+    // raw staked principal (so a small high-weight minority cannot pass an item).
+    if proposal.yes_votes <= proposal.no_votes {
+        msg!("genesis distribution proposal lacks a weighted majority");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if proposal.voted_principal <= cfg.outstanding_principal() / 2 {
+        msg!("genesis distribution proposal lacks principal quorum");
         return Err(ProgramError::InvalidInstructionData);
     }
     cfg.minted_supply = cfg
@@ -3676,1058 +3305,9 @@ fn process_approve_builder<'a>(
     Ok(())
 }
 
-// ============================================================================
-// risk vault wiring — governed setup, depositor-controlled principal
-// ============================================================================
-// init_risk_vault accounts:
-//   [0] payer (signer, writable)
-//   [1] authority (signer, governance PDA)
-//   [2] market_slab (read-only)
-//   [3] risk_vault PDA (writable, to create)
-//   [4] coin_mint (read-only)
-//   [5] coin_config PDA (read-only)
-//   [6] collateral_mint (read-only)
-//   [7] token_vault PDA (writable, to create)
-//   [8] engine_ledger PDA (writable, to create; owned by percolator)
-//   [9] token_program
-//   [10] rent sysvar
-//   [11] system_program
-//   [12] percolator_program
-//   [13] fee_destination token account (required when dao_fee_bps > 0)
-//
-// Data: kind (u8), domain (u8), lockup_slots (u64),
-//       withdraw_delay_slots (u64), dao_fee_bps (u16)
-
-fn process_init_risk_vault<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let authority = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let coin_mint = next_account_info(iter)?;
-    let coin_cfg_account = next_account_info(iter)?;
-    let collateral_mint = next_account_info(iter)?;
-    let token_vault = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-    let rent_sysvar = next_account_info(iter)?;
-    let system_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-
-    if !payer.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_token_program(token_program)?;
-    verify_percolator_program(percolator_program)?;
-
-    let kind = read_u8(data)?;
-    let domain = read_u8(data)?;
-    let suffix = risk_suffix(kind, domain)?;
-    let lockup_slots = read_u64(data)?;
-    let withdraw_delay_slots = read_u64(data)?;
-    let dao_fee_bps = read_u16(data)?;
-    if dao_fee_bps > 10_000 || !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    validate_governance_authority(authority, coin_mint.key, program_id)?;
-    let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
-    if *authority.key != coin_cfg.authority {
-        msg!("Signer does not match CoinConfig authority");
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    require_live(&coin_cfg)?;
-
-    if collateral_mint.owner != &spl_token::ID {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let mint_data = collateral_mint.try_borrow_data()?;
-    spl_token::state::Mint::unpack(&mint_data)?;
-    drop(mint_data);
-    load_percolator_market_config(market_slab, collateral_mint.key)?;
-    let fee_destination = if dao_fee_bps == 0 {
-        Pubkey::default()
-    } else {
-        if kind == RISK_KIND_INSURANCE {
-            msg!("insurance risk vault cannot charge a DAO fee");
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let fee_destination = next_account_info(iter)?;
-        let insurance_suffix = risk_suffix(RISK_KIND_INSURANCE, 0)?;
-        let expected_fee_vault = Pubkey::find_program_address(
-            &risk_token_vault_seeds(market_slab.key, &insurance_suffix),
-            program_id,
-        )
-        .0;
-        if *fee_destination.key != expected_fee_vault {
-            msg!("risk vault DAO fee must flow to the main insurance token vault");
-            return Err(ProgramError::InvalidSeeds);
-        }
-        let expected_fee_owner = Pubkey::find_program_address(
-            &risk_vault_seeds(market_slab.key, &insurance_suffix),
-            program_id,
-        )
-        .0;
-        validate_token_account(fee_destination, collateral_mint.key, &expected_fee_owner)?;
-        *fee_destination.key
-    };
-
-    let risk_vault_seed_arr = risk_vault_seeds(market_slab.key, &suffix);
-    create_pda_account(
-        payer,
-        risk_vault,
-        system_program,
-        program_id,
-        &risk_vault_seed_arr,
-        RISK_VAULT_SIZE,
-    )?;
-
-    let ledger_size = if kind == RISK_KIND_INSURANCE {
-        percolator_abi::INSURANCE_LEDGER_ACCOUNT_LEN
-    } else {
-        percolator_abi::BACKING_DOMAIN_LEDGER_ACCOUNT_LEN
-    };
-    let risk_ledger_seed_arr = risk_ledger_seeds(market_slab.key, &suffix);
-    create_pda_account_with_owner(
-        payer,
-        engine_ledger,
-        system_program,
-        program_id,
-        &risk_ledger_seed_arr,
-        ledger_size,
-        percolator_program.key,
-    )?;
-
-    let token_vault_seeds_arr = risk_token_vault_seeds(market_slab.key, &suffix);
-    let (expected_token_vault, token_vault_bump) =
-        Pubkey::find_program_address(&token_vault_seeds_arr, program_id);
-    if *token_vault.key != expected_token_vault {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    let token_vault_bump_bytes = [token_vault_bump];
-    let token_vault_signer: [&[u8]; 4] = [
-        b"risk_token_vault",
-        market_slab.key.as_ref(),
-        &suffix,
-        &token_vault_bump_bytes,
-    ];
-    let rent = Rent::get()?;
-    invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            token_vault.key,
-            rent.minimum_balance(spl_token::state::Account::LEN),
-            spl_token::state::Account::LEN as u64,
-            &spl_token::ID,
-        ),
-        &[payer.clone(), token_vault.clone(), system_program.clone()],
-        &[&token_vault_signer],
-    )?;
-    let init_ix = spl_token::instruction::initialize_account2(
-        token_program.key,
-        token_vault.key,
-        collateral_mint.key,
-        risk_vault.key,
-    )?;
-    invoke(
-        &init_ix,
-        &[
-            token_vault.clone(),
-            collateral_mint.clone(),
-            rent_sysvar.clone(),
-            token_program.clone(),
-        ],
-    )?;
-
-    let cfg = RiskVaultCfg {
-        kind,
-        domain,
-        market_slab: *market_slab.key,
-        coin_mint: *coin_mint.key,
-        collateral_mint: *collateral_mint.key,
-        token_vault: *token_vault.key,
-        engine_ledger: *engine_ledger.key,
-        lockup_slots,
-        withdraw_delay_slots,
-        total_deposited: 0,
-        total_withdrawn: 0,
-        total_shares: 0,
-        reward_per_share_stored: 0,
-        loss_per_share_stored: 0,
-        recovery_per_share_stored: 0,
-        last_reward_counter: 0,
-        last_loss_counter: 0,
-        last_recovery_counter: 0,
-        dao_fee_bps,
-        fee_destination,
-    };
-    let mut cfg_data = risk_vault.try_borrow_mut_data()?;
-    cfg.serialize(&mut cfg_data);
-    Ok(())
-}
-
-// register_risk_vault_authority accounts:
-//   [0] current_authority (signer)
-//   [1] risk_vault PDA (read-only; signs CPI via invoke_signed)
-//   [2] market_slab (writable)
-//   [3] percolator_program
-//
-// Data: percolator_authority_kind (u8)
-
-fn process_register_risk_vault_authority<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let current_authority = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-
-    if !current_authority.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_percolator_program(percolator_program)?;
-    let authority_kind = read_u8(data)?;
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    drop(cfg_data);
-    let risk_bump = verify_risk_vault_pda(risk_vault, &cfg, program_id)?;
-    if *market_slab.key != cfg.market_slab || market_slab.owner != &percolator_abi::id() {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    match (cfg.kind, authority_kind) {
-        (RISK_KIND_INSURANCE, PERC_AUTHORITY_INSURANCE)
-        | (RISK_KIND_INSURANCE, PERC_AUTHORITY_INSURANCE_OPERATOR)
-        | (RISK_KIND_BACKING, PERC_AUTHORITY_BACKING_BUCKET) => {}
-        _ => return Err(ProgramError::InvalidInstructionData),
-    }
-
-    let mut ix_data = alloc::vec::Vec::with_capacity(34);
-    ix_data.push(PERC_IX_UPDATE_AUTHORITY);
-    ix_data.push(authority_kind);
-    ix_data.extend_from_slice(risk_vault.key.as_ref());
-
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*current_authority.key, true),
-            solana_program::instruction::AccountMeta::new_readonly(*risk_vault.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-        ],
-        data: ix_data,
-    };
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let risk_bump_bytes = [risk_bump];
-    let signer_seeds: [&[u8]; 4] = [
-        b"risk_vault",
-        cfg.market_slab.as_ref(),
-        &suffix,
-        &risk_bump_bytes,
-    ];
-    invoke_signed(
-        &ix,
-        &[
-            current_authority.clone(),
-            risk_vault.clone(),
-            market_slab.clone(),
-            percolator_program.clone(),
-        ],
-        &[&signer_seeds],
-    )
-}
-
-// risk_deposit accounts:
-//   [0] user (signer)
-//   [1] risk_vault PDA (writable)
-//   [2] risk_position PDA (writable, created if absent)
-//   [3] market_slab (writable)
-//   [4] user_collateral_ata (writable)
-//   [5] risk_token_vault PDA (writable)
-//   [6] percolator_vault (writable)
-//   [7] percolator_vault_pda
-//   [8] engine_ledger PDA (writable)
-//   [9] token_program
-//   [10] percolator_program
-//   [11] system_program
-//   [12] clock
-//
-// Data: amount (u64), expiry_slot (u64; backing only, ignored for insurance)
-
-fn process_risk_deposit<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let user = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let position_account = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let user_ata = next_account_info(iter)?;
-    let risk_token_vault = next_account_info(iter)?;
-    let percolator_vault = next_account_info(iter)?;
-    let percolator_vault_pda = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-    let system_program = next_account_info(iter)?;
-    let clock_info = next_account_info(iter)?;
-
-    let amount = read_u64(data)?;
-    let expiry_slot = read_u64(data)?;
-    if amount == 0 || !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    if !user.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_percolator_program(percolator_program)?;
-
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let mut cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    let risk_bump = verify_risk_cfg_accounts(
-        program_id,
-        &cfg,
-        risk_vault,
-        market_slab,
-        risk_token_vault,
-        engine_ledger,
-        token_program,
-    )?;
-    validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
-    validate_percolator_vault_accounts(
-        market_slab,
-        percolator_vault,
-        percolator_vault_pda,
-        &cfg.collateral_mint,
-    )?;
-    let clock = Clock::from_account_info(clock_info)?;
-
-    drop(cfg_data);
-    let mut pos = risk_position_for_user(
-        program_id,
-        user,
-        risk_vault,
-        position_account,
-        Some(system_program),
-    )?;
-    settle_risk_position(&mut pos, &cfg);
-
-    let xfer_ix = spl_token::instruction::transfer(
-        token_program.key,
-        user_ata.key,
-        risk_token_vault.key,
-        user.key,
-        &[],
-        amount,
-    )?;
-    invoke(
-        &xfer_ix,
-        &[
-            user_ata.clone(),
-            risk_token_vault.clone(),
-            user.clone(),
-            token_program.clone(),
-        ],
-    )?;
-
-    let mut ix_data = alloc::vec::Vec::with_capacity(26);
-    if cfg.kind == RISK_KIND_INSURANCE {
-        ix_data.push(PERC_IX_TOP_UP_INSURANCE);
-        ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    } else {
-        ix_data.push(PERC_IX_TOP_UP_BACKING_BUCKET);
-        ix_data.push(cfg.domain);
-        ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-        ix_data.extend_from_slice(&expiry_slot.to_le_bytes());
-    }
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*risk_vault.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-            solana_program::instruction::AccountMeta::new(*risk_token_vault.key, false),
-            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
-            solana_program::instruction::AccountMeta::new(*engine_ledger.key, false),
-        ],
-        data: ix_data,
-    };
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let risk_bump_bytes = [risk_bump];
-    let signer_seeds: [&[u8]; 4] = [
-        b"risk_vault",
-        cfg.market_slab.as_ref(),
-        &suffix,
-        &risk_bump_bytes,
-    ];
-    invoke_signed(
-        &ix,
-        &[
-            risk_vault.clone(),
-            market_slab.clone(),
-            risk_token_vault.clone(),
-            percolator_vault.clone(),
-            token_program.clone(),
-            engine_ledger.clone(),
-            percolator_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    cfg.total_deposited = cfg
-        .total_deposited
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    cfg.total_shares = cfg
-        .total_shares
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.shares = pos
-        .shares
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.deposit_slot = clock.slot;
-    pos.reward_per_share_paid = cfg.reward_per_share_stored;
-    pos.loss_per_share_paid = cfg.loss_per_share_stored;
-    pos.recovery_per_share_paid = cfg.recovery_per_share_stored;
-
-    let mut cfg_data = risk_vault.try_borrow_mut_data()?;
-    cfg.serialize(&mut cfg_data);
-    let mut pos_data = position_account.try_borrow_mut_data()?;
-    pos.serialize(&mut pos_data);
-    Ok(())
-}
-
-// risk_request_withdraw accounts:
-//   [0] user (signer)
-//   [1] risk_vault PDA (read-only)
-//   [2] risk_position PDA (writable)
-//   [3] clock
-//
-// Data: amount (u64)
-
-fn process_risk_request_withdraw<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let user = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let position_account = next_account_info(iter)?;
-    let clock_info = next_account_info(iter)?;
-
-    let amount = read_u64(data)?;
-    if amount == 0 || !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    if !user.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    verify_risk_vault_pda(risk_vault, &cfg, program_id)?;
-    drop(cfg_data);
-
-    let mut pos = risk_position_for_user(program_id, user, risk_vault, position_account, None)?;
-    settle_risk_position(&mut pos, &cfg);
-    if pos.pending_withdraw_shares != 0 || amount > available_risk_shares(&pos) {
-        return Err(ProgramError::InsufficientFunds);
-    }
-    let clock = Clock::from_account_info(clock_info)?;
-    pos.pending_withdraw_shares = amount;
-    pos.withdraw_request_slot = clock.slot;
-    let mut pos_data = position_account.try_borrow_mut_data()?;
-    pos.serialize(&mut pos_data);
-    Ok(())
-}
-
-// risk_withdraw accounts:
-//   [0] user (signer)
-//   [1] risk_vault PDA (writable)
-//   [2] risk_position PDA (writable)
-//   [3] market_slab (writable)
-//   [4] user_collateral_ata (writable)
-//   [5] risk_token_vault PDA (writable)
-//   [6] percolator_vault (writable)
-//   [7] percolator_vault_pda
-//   [8] engine_ledger PDA (writable)
-//   [9] token_program
-//   [10] percolator_program
-//   [11] clock
-
-fn process_risk_withdraw<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let iter = &mut accounts.iter();
-    let user = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let position_account = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let user_ata = next_account_info(iter)?;
-    let risk_token_vault = next_account_info(iter)?;
-    let percolator_vault = next_account_info(iter)?;
-    let percolator_vault_pda = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-    let clock_info = next_account_info(iter)?;
-
-    if !user.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_percolator_program(percolator_program)?;
-
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let mut cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    let risk_bump = verify_risk_cfg_accounts(
-        program_id,
-        &cfg,
-        risk_vault,
-        market_slab,
-        risk_token_vault,
-        engine_ledger,
-        token_program,
-    )?;
-    validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
-    validate_percolator_vault_accounts(
-        market_slab,
-        percolator_vault,
-        percolator_vault_pda,
-        &cfg.collateral_mint,
-    )?;
-    drop(cfg_data);
-
-    let mut pos = risk_position_for_user(program_id, user, risk_vault, position_account, None)?;
-    settle_risk_position(&mut pos, &cfg);
-    let amount = pos.pending_withdraw_shares;
-    let available_principal = pos
-        .shares
-        .checked_sub(pos.pending_losses)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    if amount == 0 || amount > available_principal {
-        return Err(ProgramError::InsufficientFunds);
-    }
-    let clock = Clock::from_account_info(clock_info)?;
-    let unlock_slot = pos
-        .deposit_slot
-        .checked_add(cfg.lockup_slots)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    let withdraw_slot = pos
-        .withdraw_request_slot
-        .checked_add(cfg.withdraw_delay_slots)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    if clock.slot < unlock_slot || clock.slot < withdraw_slot {
-        msg!("risk withdrawal still locked");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let mut ix_data = alloc::vec::Vec::with_capacity(18);
-    if cfg.kind == RISK_KIND_INSURANCE {
-        ix_data.push(PERC_IX_WITHDRAW_INSURANCE_LIMITED);
-        ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    } else {
-        ix_data.push(PERC_IX_WITHDRAW_BACKING_BUCKET);
-        ix_data.push(cfg.domain);
-        ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    }
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*risk_vault.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-            solana_program::instruction::AccountMeta::new(*risk_token_vault.key, false),
-            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(
-                *percolator_vault_pda.key,
-                false
-            ),
-            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
-            solana_program::instruction::AccountMeta::new(*engine_ledger.key, false),
-        ],
-        data: ix_data,
-    };
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let risk_bump_bytes = [risk_bump];
-    let signer_seeds: [&[u8]; 4] = [
-        b"risk_vault",
-        cfg.market_slab.as_ref(),
-        &suffix,
-        &risk_bump_bytes,
-    ];
-    invoke_signed(
-        &ix,
-        &[
-            risk_vault.clone(),
-            market_slab.clone(),
-            risk_token_vault.clone(),
-            percolator_vault.clone(),
-            percolator_vault_pda.clone(),
-            token_program.clone(),
-            engine_ledger.clone(),
-            percolator_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    let xfer_ix = spl_token::instruction::transfer(
-        token_program.key,
-        risk_token_vault.key,
-        user_ata.key,
-        risk_vault.key,
-        &[],
-        amount,
-    )?;
-    invoke_signed(
-        &xfer_ix,
-        &[
-            risk_token_vault.clone(),
-            user_ata.clone(),
-            risk_vault.clone(),
-            token_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    cfg.total_withdrawn = cfg
-        .total_withdrawn
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    cfg.total_shares = cfg
-        .total_shares
-        .checked_sub(amount)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    pos.shares = pos
-        .shares
-        .checked_sub(amount)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    pos.pending_withdraw_shares = 0;
-    pos.withdraw_request_slot = 0;
-    pos.pending_losses = core::cmp::min(pos.pending_losses, pos.shares);
-
-    let mut cfg_data = risk_vault.try_borrow_mut_data()?;
-    cfg.serialize(&mut cfg_data);
-    let mut pos_data = position_account.try_borrow_mut_data()?;
-    pos.serialize(&mut pos_data);
-    Ok(())
-}
-
-// risk_claim_rewards accounts:
-//   [0] user (signer)
-//   [1] risk_vault PDA (writable)
-//   [2] risk_position PDA (writable)
-//   [3] market_slab (writable)
-//   [4] user_collateral_ata (writable)
-//   [5] risk_token_vault PDA (writable)
-//   [6] percolator_vault (writable)
-//   [7] percolator_vault_pda
-//   [8] engine_ledger PDA (writable)
-//   [9] token_program
-//   [10] percolator_program
-//   [11] fee_destination token account (required when accrued fee > 0)
-
-fn process_risk_claim_rewards<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let iter = &mut accounts.iter();
-    let user = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let position_account = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let user_ata = next_account_info(iter)?;
-    let risk_token_vault = next_account_info(iter)?;
-    let percolator_vault = next_account_info(iter)?;
-    let percolator_vault_pda = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-
-    if !user.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    verify_percolator_program(percolator_program)?;
-
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    let risk_bump = verify_risk_cfg_accounts(
-        program_id,
-        &cfg,
-        risk_vault,
-        market_slab,
-        risk_token_vault,
-        engine_ledger,
-        token_program,
-    )?;
-    if cfg.kind != RISK_KIND_BACKING {
-        msg!("only backing risk vaults can claim engine earnings");
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
-    validate_percolator_vault_accounts(
-        market_slab,
-        percolator_vault,
-        percolator_vault_pda,
-        &cfg.collateral_mint,
-    )?;
-    drop(cfg_data);
-
-    let mut pos = risk_position_for_user(program_id, user, risk_vault, position_account, None)?;
-    settle_risk_position(&mut pos, &cfg);
-    let amount = pos.pending_rewards;
-    if amount == 0 {
-        let mut pos_data = position_account.try_borrow_mut_data()?;
-        pos.serialize(&mut pos_data);
-        return Ok(());
-    }
-
-    let fee = ((amount as u128)
-        .checked_mul(cfg.dao_fee_bps as u128)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        / 10_000) as u64;
-    let net = amount
-        .checked_sub(fee)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    let fee_destination = if fee == 0 {
-        None
-    } else {
-        let fee_destination = next_account_info(iter)?;
-        if *fee_destination.key != cfg.fee_destination {
-            msg!("risk vault fee destination mismatch");
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let fee_token = load_token_account(fee_destination)?;
-        if fee_token.mint != cfg.collateral_mint {
-            msg!("risk vault fee destination mint mismatch");
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Some(fee_destination)
-    };
-
-    let mut ix_data = alloc::vec::Vec::with_capacity(18);
-    ix_data.push(PERC_IX_WITHDRAW_BACKING_BUCKET_EARNINGS);
-    ix_data.push(cfg.domain);
-    ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*risk_vault.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-            solana_program::instruction::AccountMeta::new(*engine_ledger.key, false),
-            solana_program::instruction::AccountMeta::new(*risk_token_vault.key, false),
-            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(
-                *percolator_vault_pda.key,
-                false
-            ),
-            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
-        ],
-        data: ix_data,
-    };
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let risk_bump_bytes = [risk_bump];
-    let signer_seeds: [&[u8]; 4] = [
-        b"risk_vault",
-        cfg.market_slab.as_ref(),
-        &suffix,
-        &risk_bump_bytes,
-    ];
-    invoke_signed(
-        &ix,
-        &[
-            risk_vault.clone(),
-            market_slab.clone(),
-            engine_ledger.clone(),
-            risk_token_vault.clone(),
-            percolator_vault.clone(),
-            percolator_vault_pda.clone(),
-            token_program.clone(),
-            percolator_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    if fee > 0 {
-        let fee_destination = fee_destination.ok_or(ProgramError::NotEnoughAccountKeys)?;
-        let fee_ix = spl_token::instruction::transfer(
-            token_program.key,
-            risk_token_vault.key,
-            fee_destination.key,
-            risk_vault.key,
-            &[],
-            fee,
-        )?;
-        invoke_signed(
-            &fee_ix,
-            &[
-                risk_token_vault.clone(),
-                fee_destination.clone(),
-                risk_vault.clone(),
-                token_program.clone(),
-            ],
-            &[&signer_seeds],
-        )?;
-    }
-    if net > 0 {
-        let net_ix = spl_token::instruction::transfer(
-            token_program.key,
-            risk_token_vault.key,
-            user_ata.key,
-            risk_vault.key,
-            &[],
-            net,
-        )?;
-        invoke_signed(
-            &net_ix,
-            &[
-                risk_token_vault.clone(),
-                user_ata.clone(),
-                risk_vault.clone(),
-                token_program.clone(),
-            ],
-            &[&signer_seeds],
-        )?;
-    }
-
-    pos.pending_rewards = 0;
-    let mut pos_data = position_account.try_borrow_mut_data()?;
-    pos.serialize(&mut pos_data);
-    Ok(())
-}
-
-// sync_risk_vault accounts:
-//   [0] risk_vault PDA (writable)
-//   [1] market_slab (writable)
-//   [2] engine_ledger PDA (writable)
-//   [3] percolator_program
-
-fn process_sync_risk_vault<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let risk_vault = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-
-    verify_percolator_program(percolator_program)?;
-    let cfg_data = risk_vault.try_borrow_data()?;
-    let mut cfg = RiskVaultCfg::deserialize(&cfg_data)?;
-    let risk_bump = verify_risk_vault_pda(risk_vault, &cfg, program_id)?;
-    if *market_slab.key != cfg.market_slab || *engine_ledger.key != cfg.engine_ledger {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    if market_slab.owner != &percolator_abi::id() || engine_ledger.owner != &percolator_abi::id() {
-        return Err(ProgramError::IllegalOwner);
-    }
-    drop(cfg_data);
-
-    let mut ix_data = alloc::vec::Vec::with_capacity(2);
-    if cfg.kind == RISK_KIND_INSURANCE {
-        ix_data.push(PERC_IX_SYNC_INSURANCE_LEDGER);
-    } else {
-        ix_data.push(PERC_IX_SYNC_BACKING_DOMAIN_LEDGER);
-        ix_data.push(cfg.domain);
-    }
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*risk_vault.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-            solana_program::instruction::AccountMeta::new(*engine_ledger.key, false),
-        ],
-        data: ix_data,
-    };
-    let suffix = risk_suffix(cfg.kind, cfg.domain)?;
-    let risk_bump_bytes = [risk_bump];
-    let signer_seeds: [&[u8]; 4] = [
-        b"risk_vault",
-        cfg.market_slab.as_ref(),
-        &suffix,
-        &risk_bump_bytes,
-    ];
-    invoke_signed(
-        &ix,
-        &[
-            risk_vault.clone(),
-            market_slab.clone(),
-            engine_ledger.clone(),
-            percolator_program.clone(),
-        ],
-        &[&signer_seeds],
-    )?;
-
-    let ledger_data = engine_ledger.try_borrow_data()?;
-    let (reward_counter, loss_counter, recovery_counter) = if cfg.kind == RISK_KIND_INSURANCE {
-        let ledger = percolator_abi::read_insurance_ledger(&ledger_data)?;
-        if ledger.market_group != cfg.market_slab.to_bytes()
-            || ledger.authority != risk_vault.key.to_bytes()
-        {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        (0, ledger.cumulative_loss_atoms, 0)
-    } else {
-        let ledger = percolator_abi::read_backing_domain_ledger(&ledger_data)?;
-        if ledger.market_group != cfg.market_slab.to_bytes()
-            || ledger.authority != risk_vault.key.to_bytes()
-            || ledger.domain != cfg.domain as u16
-        {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        (
-            ledger.total_earnings_atoms,
-            ledger.cumulative_loss_atoms,
-            ledger.cumulative_recovery_atoms,
-        )
-    };
-    drop(ledger_data);
-
-    let reward_delta = reward_counter.saturating_sub(cfg.last_reward_counter);
-    let loss_delta = loss_counter.saturating_sub(cfg.last_loss_counter);
-    let recovery_delta = recovery_counter.saturating_sub(cfg.last_recovery_counter);
-    checked_add_per_share(
-        &mut cfg.reward_per_share_stored,
-        reward_delta,
-        cfg.total_shares,
-    )?;
-    checked_add_per_share(&mut cfg.loss_per_share_stored, loss_delta, cfg.total_shares)?;
-    checked_add_per_share(
-        &mut cfg.recovery_per_share_stored,
-        recovery_delta,
-        cfg.total_shares,
-    )?;
-    cfg.last_reward_counter = reward_counter;
-    cfg.last_loss_counter = loss_counter;
-    cfg.last_recovery_counter = recovery_counter;
-
-    let mut cfg_data = risk_vault.try_borrow_mut_data()?;
-    cfg.serialize(&mut cfg_data);
-    Ok(())
-}
-
-// ============================================================================
-// u256 arithmetic helpers
-// ============================================================================
-
-fn mul_u128_wide(a: u128, b: u128) -> (u128, u128) {
-    let a_lo = a as u64 as u128;
-    let a_hi = a >> 64;
-    let b_lo = b as u64 as u128;
-    let b_hi = b >> 64;
-
-    let ll = a_lo * b_lo;
-    let lh = a_lo * b_hi;
-    let hl = a_hi * b_lo;
-    let hh = a_hi * b_hi;
-
-    let mid = (ll >> 64) + (lh & 0xFFFF_FFFF_FFFF_FFFF) + (hl & 0xFFFF_FFFF_FFFF_FFFF);
-    let lo = (ll & 0xFFFF_FFFF_FFFF_FFFF) | (mid << 64);
-    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
-
-    (lo, hi)
-}
-
-/// Divide a u256 (n_lo, n_hi) by a u128 divisor. Returns u128 (saturates on overflow).
-fn div_u256_by_u128(n_lo: u128, n_hi: u128, d: u128) -> u128 {
-    if d == 0 {
-        return u128::MAX;
-    }
-    if n_hi == 0 {
-        return n_lo / d;
-    }
-    if n_hi >= d {
-        return u128::MAX;
-    } // result would overflow u128
-
-    // Long division: process n_lo bits from high to low.
-    // After processing all of n_hi (which is < d), remainder = n_hi.
-    let mut rem: u128 = n_hi;
-    let mut quot: u128 = 0;
-
-    for i in (0..128u32).rev() {
-        let bit = (n_lo >> i) & 1;
-        let overflow = rem >> 127 != 0;
-        rem = rem.wrapping_shl(1) | bit;
-
-        if overflow || rem >= d {
-            rem = rem.wrapping_sub(d);
-            quot |= 1u128 << i;
-        }
-    }
-
-    quot
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn risk_vault_round_trips_fixed_layout() {
-        let cfg = RiskVaultCfg {
-            kind: RISK_KIND_BACKING,
-            domain: 3,
-            market_slab: Pubkey::new_unique(),
-            coin_mint: Pubkey::new_unique(),
-            collateral_mint: Pubkey::new_unique(),
-            token_vault: Pubkey::new_unique(),
-            engine_ledger: Pubkey::new_unique(),
-            lockup_slots: 11,
-            withdraw_delay_slots: 7,
-            total_deposited: 100,
-            total_withdrawn: 25,
-            total_shares: 75,
-            reward_per_share_stored: 9 * FP,
-            loss_per_share_stored: FP / 2,
-            recovery_per_share_stored: FP / 4,
-            last_reward_counter: 123,
-            last_loss_counter: 45,
-            last_recovery_counter: 6,
-            dao_fee_bps: 250,
-            fee_destination: Pubkey::new_unique(),
-        };
-
-        let mut bytes = [0u8; RISK_VAULT_SIZE];
-        cfg.serialize(&mut bytes);
-        let decoded = RiskVaultCfg::deserialize(&bytes).unwrap();
-
-        assert_eq!(decoded.kind, cfg.kind);
-        assert_eq!(decoded.domain, cfg.domain);
-        assert_eq!(decoded.market_slab, cfg.market_slab);
-        assert_eq!(decoded.token_vault, cfg.token_vault);
-        assert_eq!(decoded.engine_ledger, cfg.engine_ledger);
-        assert_eq!(decoded.lockup_slots, cfg.lockup_slots);
-        assert_eq!(decoded.withdraw_delay_slots, cfg.withdraw_delay_slots);
-        assert_eq!(decoded.reward_per_share_stored, cfg.reward_per_share_stored);
-        assert_eq!(decoded.loss_per_share_stored, cfg.loss_per_share_stored);
-        assert_eq!(
-            decoded.recovery_per_share_stored,
-            cfg.recovery_per_share_stored
-        );
-        assert_eq!(decoded.dao_fee_bps, cfg.dao_fee_bps);
-        assert_eq!(decoded.fee_destination, cfg.fee_destination);
-    }
 
     #[test]
     fn genesis_config_round_trips_fixed_layout() {
@@ -4794,13 +3374,6 @@ mod tests {
     }
 
     #[test]
-    fn insurance_risk_vaults_are_main_market_only() {
-        assert!(risk_suffix(RISK_KIND_INSURANCE, 0).is_ok());
-        assert!(risk_suffix(RISK_KIND_INSURANCE, 1).is_err());
-        assert!(risk_suffix(RISK_KIND_BACKING, 1).is_ok());
-    }
-
-    #[test]
     fn futarchy_admin_proxy_is_lifecycle_scoped() {
         assert!(!percolator_admin_tag_allowed(PERC_IX_INIT_MARKET));
         assert!(percolator_admin_tag_allowed(
@@ -4814,57 +3387,5 @@ mod tests {
         assert!(!percolator_admin_tag_allowed(
             PERC_IX_WITHDRAW_BACKING_BUCKET
         ));
-    }
-
-    #[test]
-    fn risk_position_settlement_tracks_rewards_and_losses() {
-        let cfg = RiskVaultCfg {
-            kind: RISK_KIND_INSURANCE,
-            domain: 0,
-            market_slab: Pubkey::new_unique(),
-            coin_mint: Pubkey::new_unique(),
-            collateral_mint: Pubkey::new_unique(),
-            token_vault: Pubkey::new_unique(),
-            engine_ledger: Pubkey::new_unique(),
-            lockup_slots: 0,
-            withdraw_delay_slots: 0,
-            total_deposited: 100,
-            total_withdrawn: 0,
-            total_shares: 100,
-            reward_per_share_stored: FP / 4,
-            loss_per_share_stored: FP / 8,
-            recovery_per_share_stored: 0,
-            last_reward_counter: 0,
-            last_loss_counter: 0,
-            last_recovery_counter: 0,
-            dao_fee_bps: 0,
-            fee_destination: Pubkey::default(),
-        };
-        let mut pos = RiskPosition {
-            owner: Pubkey::new_unique(),
-            shares: 40,
-            deposit_slot: 0,
-            pending_withdraw_shares: 0,
-            withdraw_request_slot: 0,
-            reward_per_share_paid: 0,
-            loss_per_share_paid: 0,
-            recovery_per_share_paid: 0,
-            pending_rewards: 0,
-            pending_losses: 0,
-        };
-
-        settle_risk_position(&mut pos, &cfg);
-
-        assert_eq!(pos.pending_rewards, 10);
-        assert_eq!(pos.pending_losses, 5);
-        assert_eq!(available_risk_shares(&pos), 35);
-
-        let recovered_cfg = RiskVaultCfg {
-            recovery_per_share_stored: FP / 16,
-            ..cfg
-        };
-        settle_risk_position(&mut pos, &recovered_cfg);
-        assert_eq!(pos.pending_losses, 3);
-        assert_eq!(available_risk_shares(&pos), 37);
     }
 }

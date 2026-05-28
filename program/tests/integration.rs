@@ -41,8 +41,6 @@ const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
 
 // All-zeros feed_id = Hyperp mode (no external oracle read at init)
 const TEST_FEED_ID: [u8; 32] = [0u8; 32];
-const PERC_AUTHORITY_INSURANCE: u8 = 2;
-const PERC_AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
 fn read_percolator_config(data: &[u8]) -> percolator_prog::state::WrapperConfigV16 {
     percolator_prog::state::read_market_config_mode_and_capacity(data)
@@ -360,43 +358,6 @@ fn encode_governance_transfer_mint_authority() -> Vec<u8> {
 
 fn encode_governance_activate_live() -> Vec<u8> {
     vec![7u8]
-}
-
-fn encode_governance_init_risk_vault(
-    kind: u8,
-    domain: u8,
-    lockup_slots: u64,
-    withdraw_delay_slots: u64,
-    dao_fee_bps: u16,
-) -> Vec<u8> {
-    let mut data = vec![8u8];
-    data.push(kind);
-    data.push(domain);
-    data.extend_from_slice(&lockup_slots.to_le_bytes());
-    data.extend_from_slice(&withdraw_delay_slots.to_le_bytes());
-    data.extend_from_slice(&dao_fee_bps.to_le_bytes());
-    data
-}
-
-fn encode_register_risk_vault_authority(authority_kind: u8) -> Vec<u8> {
-    vec![13u8, authority_kind]
-}
-
-fn encode_risk_deposit(amount: u64, expiry_slot: u64) -> Vec<u8> {
-    let mut data = vec![14u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    data.extend_from_slice(&expiry_slot.to_le_bytes());
-    data
-}
-
-fn encode_risk_request_withdraw(amount: u64) -> Vec<u8> {
-    let mut data = vec![15u8];
-    data.extend_from_slice(&amount.to_le_bytes());
-    data
-}
-
-fn encode_risk_withdraw() -> Vec<u8> {
-    vec![16u8]
 }
 
 fn encode_init_percolator_market(percolator_init_data: Vec<u8>) -> Vec<u8> {
@@ -881,67 +842,6 @@ impl TestEnv {
             .expect("activate_live failed");
     }
 
-    fn try_init_risk_vault(
-        &mut self,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        dao_fee_bps: u16,
-        fee_destination: Option<Pubkey>,
-    ) -> Result<(), String> {
-        let signer = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
-        let risk_vault = self.risk_vault_pda_for(slab, kind, domain);
-        let token_vault = self.risk_token_vault_pda_for(slab, kind, domain);
-        let engine_ledger = self.risk_ledger_pda_for(slab, kind, domain);
-        let mut accounts = vec![
-            AccountMeta::new(signer.pubkey(), true),
-            AccountMeta::new(self.governance_authority_pda, false),
-            AccountMeta::new_readonly(self.rewards_id, false),
-            AccountMeta::new_readonly(*slab, false),
-            AccountMeta::new(risk_vault, false),
-            AccountMeta::new_readonly(self.coin_mint, false),
-            AccountMeta::new_readonly(self.coin_cfg_pda(), false),
-            AccountMeta::new_readonly(self.collateral_mint, false),
-            AccountMeta::new(token_vault, false),
-            AccountMeta::new(engine_ledger, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(self.percolator_id, false),
-        ];
-        if let Some(fee_destination) = fee_destination {
-            accounts.push(AccountMeta::new_readonly(fee_destination, false));
-        }
-        let ix = Instruction {
-            program_id: self.governance_id,
-            accounts,
-            data: encode_governance_init_risk_vault(kind, domain, 5, 7, dao_fee_bps),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer.pubkey()),
-            &[&signer],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
-
-    fn init_risk_vault(
-        &mut self,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        dao_fee_bps: u16,
-        fee_destination: Option<Pubkey>,
-    ) {
-        self.try_init_risk_vault(slab, kind, domain, dao_fee_bps, fee_destination)
-            .expect("init_risk_vault failed");
-    }
-
     fn market_admin_pda(&self) -> Pubkey {
         Pubkey::find_program_address(
             &[b"percolator_market_admin", self.coin_mint.as_ref()],
@@ -1007,254 +907,6 @@ impl TestEnv {
             &self.rewards_id,
         )
         .0
-    }
-
-    fn risk_vault_pda_for(&self, slab: &Pubkey, kind: u8, domain: u8) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"risk_vault", slab.as_ref(), &[kind, domain]],
-            &self.rewards_id,
-        )
-        .0
-    }
-
-    fn risk_token_vault_pda_for(&self, slab: &Pubkey, kind: u8, domain: u8) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"risk_token_vault", slab.as_ref(), &[kind, domain]],
-            &self.rewards_id,
-        )
-        .0
-    }
-
-    fn risk_ledger_pda_for(&self, slab: &Pubkey, kind: u8, domain: u8) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"risk_ledger", slab.as_ref(), &[kind, domain]],
-            &self.rewards_id,
-        )
-        .0
-    }
-
-    fn risk_position_pda_for(&self, risk_vault: &Pubkey, user: &Pubkey) -> Pubkey {
-        Pubkey::find_program_address(
-            &[b"risk_position", risk_vault.as_ref(), user.as_ref()],
-            &self.rewards_id,
-        )
-        .0
-    }
-
-    fn percolator_vault_pda_for(&self, slab: &Pubkey) -> Pubkey {
-        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id).0
-    }
-
-    fn register_risk_vault_authority(
-        &mut self,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        authority_kind: u8,
-    ) {
-        let signer = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
-        let risk_vault = self.risk_vault_pda_for(slab, kind, domain);
-        let ix = Instruction {
-            program_id: self.rewards_id,
-            accounts: vec![
-                AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new_readonly(risk_vault, false),
-                AccountMeta::new(*slab, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
-            ],
-            data: encode_register_risk_vault_authority(authority_kind),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&signer.pubkey()),
-            &[&signer],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .expect("register_risk_vault_authority failed");
-    }
-
-    fn try_risk_deposit(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        user_ata: &Pubkey,
-        percolator_vault: &Pubkey,
-        amount: u64,
-        expiry_slot: u64,
-    ) -> Result<(), String> {
-        let risk_vault = self.risk_vault_pda_for(slab, kind, domain);
-        let position = self.risk_position_pda_for(&risk_vault, &user.pubkey());
-        let token_vault = self.risk_token_vault_pda_for(slab, kind, domain);
-        let engine_ledger = self.risk_ledger_pda_for(slab, kind, domain);
-        let percolator_vault_pda = self.percolator_vault_pda_for(slab);
-        let ix = Instruction {
-            program_id: self.rewards_id,
-            accounts: vec![
-                AccountMeta::new(user.pubkey(), true),
-                AccountMeta::new(risk_vault, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new(*slab, false),
-                AccountMeta::new(*user_ata, false),
-                AccountMeta::new(token_vault, false),
-                AccountMeta::new(*percolator_vault, false),
-                AccountMeta::new_readonly(percolator_vault_pda, false),
-                AccountMeta::new(engine_ledger, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_risk_deposit(amount, expiry_slot),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[
-                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                ix,
-            ],
-            Some(&user.pubkey()),
-            &[user],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
-
-    fn risk_deposit(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        user_ata: &Pubkey,
-        percolator_vault: &Pubkey,
-        amount: u64,
-        expiry_slot: u64,
-    ) {
-        self.try_risk_deposit(
-            user,
-            slab,
-            kind,
-            domain,
-            user_ata,
-            percolator_vault,
-            amount,
-            expiry_slot,
-        )
-        .expect("risk_deposit failed");
-    }
-
-    fn try_risk_request_withdraw(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        amount: u64,
-    ) -> Result<(), String> {
-        let risk_vault = self.risk_vault_pda_for(slab, kind, domain);
-        let position = self.risk_position_pda_for(&risk_vault, &user.pubkey());
-        let ix = Instruction {
-            program_id: self.rewards_id,
-            accounts: vec![
-                AccountMeta::new(user.pubkey(), true),
-                AccountMeta::new_readonly(risk_vault, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_risk_request_withdraw(amount),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&user.pubkey()),
-            &[user],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
-
-    fn risk_request_withdraw(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        amount: u64,
-    ) {
-        self.try_risk_request_withdraw(user, slab, kind, domain, amount)
-            .expect("risk_request_withdraw failed");
-    }
-
-    fn try_risk_withdraw(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        user_ata: &Pubkey,
-        percolator_vault: &Pubkey,
-    ) -> Result<(), String> {
-        let risk_vault = self.risk_vault_pda_for(slab, kind, domain);
-        let position = self.risk_position_pda_for(&risk_vault, &user.pubkey());
-        let token_vault = self.risk_token_vault_pda_for(slab, kind, domain);
-        let engine_ledger = self.risk_ledger_pda_for(slab, kind, domain);
-        let percolator_vault_pda = self.percolator_vault_pda_for(slab);
-        let ix = Instruction {
-            program_id: self.rewards_id,
-            accounts: vec![
-                AccountMeta::new(user.pubkey(), true),
-                AccountMeta::new(risk_vault, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new(*slab, false),
-                AccountMeta::new(*user_ata, false),
-                AccountMeta::new(token_vault, false),
-                AccountMeta::new(*percolator_vault, false),
-                AccountMeta::new_readonly(percolator_vault_pda, false),
-                AccountMeta::new(engine_ledger, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(self.percolator_id, false),
-                AccountMeta::new_readonly(sysvar::clock::ID, false),
-            ],
-            data: encode_risk_withdraw(),
-        };
-        self.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[
-                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-                ix,
-            ],
-            Some(&user.pubkey()),
-            &[user],
-            self.svm.latest_blockhash(),
-        );
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|e| format!("{:?}", e))
-    }
-
-    fn risk_withdraw(
-        &mut self,
-        user: &Keypair,
-        slab: &Pubkey,
-        kind: u8,
-        domain: u8,
-        user_ata: &Pubkey,
-        percolator_vault: &Pubkey,
-    ) {
-        self.try_risk_withdraw(user, slab, kind, domain, user_ata, percolator_vault)
-            .expect("risk_withdraw failed");
     }
 
     fn init_genesis_bootstrap(&mut self, reward_supply: u64) {
@@ -2429,10 +2081,9 @@ fn test_genesis_bootstrap_votes_distribution_withdrawal_and_surplus() {
         .svm
         .get_account(&env.genesis_position_pda(&alice.pubkey()))
         .unwrap();
-    assert_eq!(
-        u64::from_le_bytes(alice_pos.data[56..64].try_into().unwrap()),
-        1,
-        "one base unit gives one vote"
+    assert!(
+        u64::from_le_bytes(alice_pos.data[56..64].try_into().unwrap()) > 0,
+        "deposit records a start slot for time-weighting"
     );
 
     let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
@@ -2512,39 +2163,33 @@ fn test_genesis_bootstrap_votes_distribution_withdrawal_and_surplus() {
 }
 
 #[test]
-fn test_genesis_deposit_window_closes_before_bootstrap_delay() {
+fn test_genesis_deposits_stay_open_until_voting_starts() {
     let mut env = TestEnv::new_meta_only();
     env.init_coin_config_with_delay(50);
     env.init_genesis_bootstrap_with_deposit_window(100, 5);
 
-    let cfg_account = env.svm.get_account(&env.genesis_cfg_pda()).unwrap();
-    assert_eq!(
-        u64::from_le_bytes(cfg_account.data[176..184].try_into().unwrap()),
-        105,
-        "deposit window closes five slots after bootstrap init"
-    );
-
     let early = Keypair::new();
-    let last_slot = Keypair::new();
+    let mid = Keypair::new();
     let late = Keypair::new();
-    for user in [&early, &last_slot, &late] {
+    for user in [&early, &mid, &late] {
         env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
     }
 
-    env.genesis_deposit(&early, 1);
-    env.set_clock(104);
-    env.genesis_deposit(&last_slot, 1);
-    env.set_clock(105);
+    // Joining stays open across the whole pre-live bootstrap phase, not a fixed
+    // window: a deposit far past the old window still succeeds.
+    env.genesis_deposit(&early, 1); // slot 100
+    env.set_clock(140);
+    env.genesis_deposit(&mid, 1); // well past the old 105-slot window
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 2);
+
+    // Once the bootstrap delay elapses and the COIN goes live (voting starts),
+    // joining closes.
+    env.set_clock(150);
+    env.activate_live();
     let late_deposit = env.try_genesis_deposit(&late, 1);
     assert!(
         late_deposit.is_err(),
-        "late deposit must fail even though the bootstrap delay has not elapsed"
-    );
-
-    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
-    assert!(
-        env.try_activate_live(&dao).is_err(),
-        "bootstrap live activation is still gated by the longer delay"
+        "joining closes once voting starts (COIN live)"
     );
     assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 2);
 }
@@ -2598,8 +2243,8 @@ fn test_genesis_finalize_requires_market_kickstart() {
 
     let voter = Keypair::new();
     env.svm.airdrop(&voter.pubkey(), 10_000_000_000).unwrap();
-    env.genesis_deposit(&voter, 1);
-    env.set_clock(101);
+    env.genesis_deposit(&voter, 1); // slot 100
+    env.set_clock(110); // live (delay 1) and age >= 2 for nonzero log-weight
     env.activate_live();
 
     let destination = env.create_coin_ata(&voter.pubkey(), 0);
@@ -2627,9 +2272,9 @@ fn test_underfunded_genesis_withdrawal_keeps_unpaid_principal_claim() {
     let bob = Keypair::new();
     env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
     env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
-    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&alice, 2); // slot 100
     env.genesis_deposit(&bob, 2);
-    env.set_clock(101);
+    env.set_clock(110); // live (delay 1) and age >= 2 for nonzero log-weight
     env.activate_live();
 
     let destination = env.create_coin_ata(&alice.pubkey(), 0);
@@ -2703,11 +2348,13 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
         "only genesis depositors with recorded vote units can vote"
     );
 
+    // Both joined at slot 100 and vote at slot 120, so age = 20 and each base
+    // unit weighs floor(log2(20)) = 4.
     env.vote_genesis_distribution(&alice, 1, true);
     let one_yes = env.try_governance_genesis_mint_reward(1, 100, &destination);
     assert!(
         one_yes.is_err(),
-        "exactly half of deposited vote units is not a strict majority"
+        "one of two equal depositors does not meet the principal quorum"
     );
 
     env.vote_genesis_distribution(&bob, 1, false);
@@ -2717,11 +2364,13 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
         .unwrap();
     assert_eq!(
         u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()),
-        1
+        4,
+        "alice yes weight = log2(20) * 1"
     );
     assert_eq!(
         u64::from_le_bytes(proposal.data[96..104].try_into().unwrap()),
-        1
+        4,
+        "bob no weight = log2(20) * 1"
     );
 
     env.vote_genesis_distribution(&bob, 1, true);
@@ -2731,7 +2380,7 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
         .unwrap();
     assert_eq!(
         u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()),
-        2,
+        8,
         "revoting removes the old ballot before adding the new one"
     );
     assert_eq!(
@@ -2745,7 +2394,7 @@ fn test_genesis_vote_records_are_nontransferable_and_strict_majority() {
             &env.genesis_distribution_vote_pda(&env.genesis_distribution_pda(1), &bob.pubkey()),
         )
         .unwrap();
-    assert_eq!(u64::from_le_bytes(vote.data[72..80].try_into().unwrap()), 1);
+    assert_eq!(u64::from_le_bytes(vote.data[72..80].try_into().unwrap()), 4);
     assert_eq!(vote.data[80], 1);
 
     env.governance_genesis_mint_reward(1, 100, &destination);
@@ -2902,113 +2551,6 @@ fn test_builder_code_approval_registry_is_governed_and_versioned() {
     let account = env.svm.get_account(&approval).unwrap();
     assert_eq!(&account.data[104..136], &new_terms_hash);
     assert_eq!(account.data[144], 0);
-}
-
-#[test]
-fn test_risk_vault_setup_is_live_gated_and_fees_route_to_main_insurance() {
-    let mut env = TestEnv::new();
-    env.init_coin_config_with_delay(10);
-    let slab = env.slab;
-
-    let early = env.try_init_risk_vault(&slab, 0, 0, 0, None);
-    assert!(
-        early.is_err(),
-        "risk vault setup is only allowed after the COIN instance is live"
-    );
-
-    env.set_clock(110);
-    env.activate_live();
-    env.init_risk_vault(&slab, 0, 0, 0, None);
-
-    let collateral_mint = env.collateral_mint;
-    let dao_authority = env.dao_authority.pubkey();
-    let arbitrary_fee_destination = env.create_ata(&collateral_mint, &dao_authority, 0);
-    let bad_fee = env.try_init_risk_vault(&slab, 1, 2, 250, Some(arbitrary_fee_destination));
-    assert!(
-        bad_fee.is_err(),
-        "external backing fees must be routed to the main insurance token vault"
-    );
-
-    let insurance_fee_destination = env.risk_token_vault_pda_for(&slab, 0, 0);
-    env.init_risk_vault(&slab, 1, 2, 250, Some(insurance_fee_destination));
-    let backing_cfg = env
-        .svm
-        .get_account(&env.risk_vault_pda_for(&slab, 1, 2))
-        .unwrap();
-    assert_eq!(
-        Pubkey::new_from_array(backing_cfg.data[320..352].try_into().unwrap()),
-        insurance_fee_destination
-    );
-}
-
-#[test]
-fn test_risk_vault_deposit_withdraw_enforces_lockup_and_delay() {
-    let mut env = TestEnv::new();
-    env.init_coin_config_with_delay(1);
-    env.set_clock(101);
-    env.activate_live();
-
-    let slab = env.slab;
-    let percolator_vault = env.vault;
-    env.init_risk_vault(&slab, 0, 0, 0, None);
-    env.register_risk_vault_authority(&slab, 0, 0, PERC_AUTHORITY_INSURANCE);
-    env.register_risk_vault_authority(&slab, 0, 0, PERC_AUTHORITY_INSURANCE_OPERATOR);
-
-    let user = Keypair::new();
-    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
-    let collateral_mint = env.collateral_mint;
-    let user_ata = env.create_ata(&collateral_mint, &user.pubkey(), 10);
-    env.risk_deposit(&user, &slab, 0, 0, &user_ata, &percolator_vault, 10, 0);
-
-    let risk_vault = env.risk_vault_pda_for(&slab, 0, 0);
-    let cfg_account = env.svm.get_account(&risk_vault).unwrap();
-    assert_eq!(
-        u64::from_le_bytes(cfg_account.data[192..200].try_into().unwrap()),
-        10
-    );
-    assert_eq!(
-        u64::from_le_bytes(cfg_account.data[208..216].try_into().unwrap()),
-        10
-    );
-    assert_eq!(env.read_token_balance(&user_ata), 0);
-    assert_eq!(env.read_token_balance(&percolator_vault), 10);
-
-    env.risk_request_withdraw(&user, &slab, 0, 0, 4);
-    assert!(
-        env.try_risk_withdraw(&user, &slab, 0, 0, &user_ata, &percolator_vault)
-            .is_err(),
-        "withdrawal cannot bypass the initial lockup and request delay"
-    );
-
-    env.set_clock(106);
-    assert!(
-        env.try_risk_withdraw(&user, &slab, 0, 0, &user_ata, &percolator_vault)
-            .is_err(),
-        "lockup expiry alone is insufficient before the withdrawal delay matures"
-    );
-
-    env.set_clock(108);
-    env.risk_withdraw(&user, &slab, 0, 0, &user_ata, &percolator_vault);
-    assert_eq!(env.read_token_balance(&user_ata), 4);
-    assert_eq!(env.read_token_balance(&percolator_vault), 6);
-
-    let cfg_account = env.svm.get_account(&risk_vault).unwrap();
-    assert_eq!(
-        u64::from_le_bytes(cfg_account.data[200..208].try_into().unwrap()),
-        4
-    );
-    assert_eq!(
-        u64::from_le_bytes(cfg_account.data[208..216].try_into().unwrap()),
-        6
-    );
-    let pos_account = env
-        .svm
-        .get_account(&env.risk_position_pda_for(&risk_vault, &user.pubkey()))
-        .unwrap();
-    assert_eq!(
-        u64::from_le_bytes(pos_account.data[40..48].try_into().unwrap()),
-        6
-    );
 }
 
 #[test]
@@ -3868,7 +3410,8 @@ fn encode_genesis_bootstrap_withdraw(
     d
 }
 
-fn read_genesis_vote_units(env: &TestEnv, user: &Pubkey) -> u64 {
+/// Reads the position's start_slot (offset 56); 0 means never-deposited or exited.
+fn read_genesis_start_slot(env: &TestEnv, user: &Pubkey) -> u64 {
     let pos = env.svm.get_account(&env.genesis_position_pda(user)).unwrap();
     u64::from_le_bytes(pos.data[56..64].try_into().unwrap())
 }
@@ -3889,7 +3432,7 @@ fn test_genesis_bootstrap_withdraw_before_kickstart_full_refund() {
     let alice = Keypair::new();
     env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
     env.genesis_deposit(&alice, 5);
-    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 5);
+    assert!(read_genesis_start_slot(&env, &alice.pubkey()) > 0, "start slot recorded");
     assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 5);
 
     let collateral_mint = env.collateral_mint;
@@ -3921,7 +3464,7 @@ fn test_genesis_bootstrap_withdraw_before_kickstart_full_refund() {
         .expect("bootstrap withdraw before kickstart failed");
 
     assert_eq!(env.read_token_balance(&user_ata), 5, "full refund");
-    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "vote forfeited");
+    assert_eq!(read_genesis_start_slot(&env, &alice.pubkey()), 0, "vote forfeited");
     assert_eq!(read_genesis_position_amount(&env, &alice.pubkey()), 0, "principal claim cleared");
     assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0, "vault drained");
     // total_deposited shrank to 0.
@@ -3990,7 +3533,7 @@ fn test_genesis_bootstrap_withdraw_after_kickstart_pulls_from_market() {
         .expect("bootstrap withdraw after kickstart failed");
 
     assert_eq!(env.read_token_balance(&user_ata), 2, "principal recovered from market");
-    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "vote forfeited");
+    assert_eq!(read_genesis_start_slot(&env, &alice.pubkey()), 0, "vote forfeited");
     assert_eq!(env.percolator_insurance_balance(&slab), 1, "insurance drawn down by 1");
 }
 
@@ -4041,7 +3584,15 @@ fn test_genesis_bootstrap_withdraw_closed_after_voting_starts() {
         env.svm.send_transaction(tx).is_err(),
         "exit must be closed once voting starts"
     );
-    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 3, "vote retained");
+    assert_eq!(
+        read_genesis_position_amount(&env, &alice.pubkey()),
+        3,
+        "stake retained (exit rejected after voting starts)"
+    );
+    assert!(
+        read_genesis_start_slot(&env, &alice.pubkey()) > 0,
+        "start slot intact (exit rejected)"
+    );
 }
 
 // ============================================================================
@@ -4150,7 +3701,7 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     );
     env.svm.send_transaction(tx).expect("carol mid-bootstrap exit");
     assert_eq!(env.read_token_balance(&carol_ata), 2, "carol recovered her principal");
-    assert_eq!(read_genesis_vote_units(&env, &carol.pubkey()), 0, "carol forfeited her vote");
+    assert_eq!(read_genesis_start_slot(&env, &carol.pubkey()), 0, "carol forfeited her vote");
     assert_eq!(env.percolator_insurance_balance(&slab), 4, "insurance drawn down by carol's share");
 
     // --- 6. Voting opens once the COIN goes live ---
@@ -4244,6 +3795,206 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     let bob_base = env.genesis_withdraw(&bob);
     assert_eq!(env.read_token_balance(&alice_base), 4, "alice principal returned");
     assert_eq!(env.read_token_balance(&bob_base), 4, "bob principal returned");
-    assert_eq!(read_genesis_vote_units(&env, &alice.pubkey()), 0, "votes worthless after withdrawal");
+    assert_eq!(read_genesis_start_slot(&env, &alice.pubkey()), 0, "votes worthless after withdrawal");
     assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0, "vault fully distributed");
+}
+
+// ============================================================================
+// Time-weighted vote coverage + bootstrap-exit input guards (restored)
+// ============================================================================
+
+fn read_vote_weight(env: &TestEnv, proposal_id: u64, voter: &Pubkey) -> u64 {
+    let proposal = env.genesis_distribution_pda(proposal_id);
+    let rec = env
+        .svm
+        .get_account(&env.genesis_distribution_vote_pda(&proposal, voter))
+        .unwrap();
+    u64::from_le_bytes(rec.data[72..80].try_into().unwrap())
+}
+
+/// Two equal-size deposits, one earlier: the earlier joiner weighs strictly more.
+#[test]
+fn test_genesis_vote_weight_rewards_earlier_joiners() {
+    let mut env = TestEnv::new_meta_only();
+    env.init_coin_config_with_delay(2000);
+    env.init_genesis_bootstrap(100);
+
+    let early = Keypair::new();
+    let late = Keypair::new();
+    for u in [&early, &late] {
+        env.svm.airdrop(&u.pubkey(), 10_000_000_000).unwrap();
+    }
+    env.genesis_deposit(&early, 1); // slot 100 -> start_slot 100
+    env.set_clock(2000);
+    env.genesis_deposit(&late, 1); // slot 2000 -> start_slot 2000
+    env.set_clock(2100);
+    env.activate_live();
+
+    let dest = env.create_coin_ata(&early.pubkey(), 0);
+    env.init_genesis_distribution(1, 100, &dest);
+    env.vote_genesis_distribution(&early, 1, true);
+    env.vote_genesis_distribution(&late, 1, true);
+
+    assert_eq!(read_vote_weight(&env, 1, &early.pubkey()), 10, "floor(log2(2000)) * 1");
+    assert_eq!(read_vote_weight(&env, 1, &late.pubkey()), 6, "floor(log2(100)) * 1");
+    assert!(read_vote_weight(&env, 1, &early.pubkey()) > read_vote_weight(&env, 1, &late.pubkey()));
+}
+
+/// A second deposit resets the start slot (last-write-time): topping up late
+/// surrenders the early-join multiplier even as principal grows.
+#[test]
+fn test_genesis_last_deposit_resets_vote_clock() {
+    let mut env = TestEnv::new_meta_only();
+    env.init_coin_config_with_delay(2000);
+    env.init_genesis_bootstrap(100);
+
+    let steady = Keypair::new();
+    let topper = Keypair::new();
+    for u in [&steady, &topper] {
+        env.svm.airdrop(&u.pubkey(), 10_000_000_000).unwrap();
+    }
+    env.genesis_deposit(&steady, 1); // start_slot 100, untouched
+    env.genesis_deposit(&topper, 1); // start_slot 100
+    env.set_clock(2000);
+    env.genesis_deposit(&topper, 1); // last-write-time resets start_slot -> 2000
+    env.set_clock(2100);
+    env.activate_live();
+
+    let dest = env.create_coin_ata(&steady.pubkey(), 0);
+    env.init_genesis_distribution(1, 100, &dest);
+    env.vote_genesis_distribution(&steady, 1, true);
+    env.vote_genesis_distribution(&topper, 1, true);
+
+    // steady: age 2000, staked 1 -> floor(log2(2000)) * 1 = 10.
+    // topper: reset to slot 2000 so age 100, staked 2 -> floor(log2(100)) * 2 = 12.
+    assert_eq!(read_vote_weight(&env, 1, &steady.pubkey()), 10);
+    assert_eq!(read_vote_weight(&env, 1, &topper.pubkey()), 12);
+}
+
+/// Approval needs more than half the outstanding principal to have voted; exactly
+/// half is not a quorum.
+#[test]
+fn test_genesis_distribution_requires_principal_quorum() {
+    let mut env = TestEnv::new_meta_only();
+    env.init_coin_config_with_delay(2000);
+    env.init_genesis_bootstrap(100);
+
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let c = Keypair::new();
+    for k in [&a, &b, &c] {
+        env.svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
+    }
+    env.genesis_deposit(&a, 2);
+    env.genesis_deposit(&b, 1);
+    env.genesis_deposit(&c, 1); // outstanding principal = 4, quorum needs > 2
+    env.set_clock(2100);
+    env.activate_live();
+
+    let dest = env.create_coin_ata(&a.pubkey(), 0);
+    env.init_genesis_distribution(1, 100, &dest);
+
+    env.vote_genesis_distribution(&a, 1, true); // principal 2 = exactly half
+    assert!(
+        env.try_governance_genesis_mint_reward(1, 100, &dest).is_err(),
+        "exactly half the outstanding principal is not a quorum"
+    );
+    env.vote_genesis_distribution(&b, 1, true); // -> 3 > 2
+    env.governance_genesis_mint_reward(1, 100, &dest);
+    assert_eq!(env.read_token_balance(&dest), 100);
+}
+
+fn genesis_bootstrap_exit_ix(
+    env: &mut TestEnv,
+    user: &Keypair,
+    backing_domain: u8,
+    insurance_pull: u64,
+    backing_pull: u64,
+    market: Option<(Pubkey, Pubkey)>,
+) -> Instruction {
+    let collateral_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&collateral_mint, &user.pubkey(), 0);
+    let mut accounts = vec![
+        AccountMeta::new(user.pubkey(), true),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+        AccountMeta::new(env.genesis_cfg_pda(), false),
+        AccountMeta::new(env.genesis_position_pda(&user.pubkey()), false),
+        AccountMeta::new(user_ata, false),
+        AccountMeta::new(env.genesis_vault_pda(), false),
+        AccountMeta::new_readonly(env.market_admin_pda(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    if let Some((slab, percolator_vault)) = market {
+        let (pvp, _) = Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+        accounts.push(AccountMeta::new(slab, false));
+        accounts.push(AccountMeta::new(percolator_vault, false));
+        accounts.push(AccountMeta::new_readonly(pvp, false));
+        accounts.push(AccountMeta::new_readonly(env.percolator_id, false));
+    }
+    Instruction {
+        program_id: env.rewards_id,
+        accounts,
+        data: encode_genesis_bootstrap_withdraw(backing_domain, insurance_pull, backing_pull),
+    }
+}
+
+/// Before kickstart there is no market to draw from, so market-pull amounts are rejected.
+#[test]
+fn test_genesis_bootstrap_exit_prekickstart_rejects_market_pull() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 4);
+
+    let ix = genesis_bootstrap_exit_ix(&mut env, &alice, 0, 1, 0, None);
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "pre-kickstart exit must reject market-pull amounts"
+    );
+    assert_eq!(read_genesis_position_amount(&env, &alice.pubkey()), 4);
+    assert!(read_genesis_start_slot(&env, &alice.pubkey()) > 0);
+}
+
+/// A depositor cannot pull more than their own remaining principal from the shared pools.
+#[test]
+fn test_genesis_bootstrap_exit_rejects_overpull() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&bob, 2);
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+
+    // alice's remaining is 2; pulling 2 + 2 = 4 exceeds it.
+    let ix = genesis_bootstrap_exit_ix(&mut env, &alice, 0, 2, 2, Some((slab, percolator_vault)));
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ix,
+        ],
+        Some(&alice.pubkey()),
+        &[&alice],
+        env.svm.latest_blockhash(),
+    );
+    assert!(
+        env.svm.send_transaction(tx).is_err(),
+        "cannot recover more than the remaining principal"
+    );
+    assert_eq!(env.percolator_insurance_balance(&slab), 2, "market untouched on rejected over-pull");
 }

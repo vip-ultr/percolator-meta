@@ -30,7 +30,6 @@ const IX_INIT_COIN_CONFIG: u8 = 1;
 const IX_MINT_REWARD: u8 = 4;
 const IX_TRANSFER_MINT_AUTHORITY: u8 = 6;
 const IX_ACTIVATE_LIVE: u8 = 7;
-const IX_INIT_RISK_VAULT: u8 = 8;
 const IX_PERCOLATOR_ADMIN: u8 = 9;
 const IX_INIT_GENESIS_BOOTSTRAP: u8 = 10;
 const IX_GENESIS_MINT_REWARD: u8 = 11;
@@ -84,15 +83,6 @@ fn read_u64(data: &mut &[u8]) -> Result<u64, ProgramError> {
     }
     let value = u64::from_le_bytes(data[..8].try_into().unwrap());
     *data = &data[8..];
-    Ok(value)
-}
-
-fn read_u16(data: &mut &[u8]) -> Result<u16, ProgramError> {
-    if data.len() < 2 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let value = u16::from_le_bytes(data[..2].try_into().unwrap());
-    *data = &data[2..];
     Ok(value)
 }
 
@@ -185,7 +175,6 @@ pub fn process_instruction<'a>(
         IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
         IX_TRANSFER_MINT_AUTHORITY => process_transfer_mint_authority(program_id, accounts),
         IX_ACTIVATE_LIVE => process_activate_live(program_id, accounts, &mut data),
-        IX_INIT_RISK_VAULT => process_init_risk_vault(program_id, accounts, &mut data),
         IX_PERCOLATOR_ADMIN => process_percolator_admin(program_id, accounts, &data),
         IX_INIT_GENESIS_BOOTSTRAP => {
             process_init_genesis_bootstrap(program_id, accounts, &mut data)
@@ -390,105 +379,6 @@ fn process_activate_live<'a>(
         ],
         &[&signer_seeds],
     )
-}
-
-fn process_init_risk_vault<'a>(
-    program_id: &Pubkey,
-    accounts: &'a [AccountInfo<'a>],
-    data: &mut &[u8],
-) -> ProgramResult {
-    let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
-    let authority = next_account_info(iter)?;
-    let rewards_program = next_account_info(iter)?;
-    let market_slab = next_account_info(iter)?;
-    let risk_vault = next_account_info(iter)?;
-    let coin_mint = next_account_info(iter)?;
-    let coin_cfg = next_account_info(iter)?;
-    let collateral_mint = next_account_info(iter)?;
-    let token_vault = next_account_info(iter)?;
-    let engine_ledger = next_account_info(iter)?;
-    let token_program = next_account_info(iter)?;
-    let rent_sysvar = next_account_info(iter)?;
-    let system_program = next_account_info(iter)?;
-    let percolator_program = next_account_info(iter)?;
-
-    let kind = read_u8(data)?;
-    let domain = read_u8(data)?;
-    let lockup_slots = read_u64(data)?;
-    let withdraw_delay_slots = read_u64(data)?;
-    let dao_fee_bps = read_u16(data)?;
-    if dao_fee_bps > 10_000 || !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    let bump = verify_authority_controller(
-        program_id,
-        payer,
-        authority,
-        rewards_program.key,
-        coin_mint.key,
-    )?;
-    let bump_bytes = [bump];
-    let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
-    let fee_destination = if dao_fee_bps == 0 {
-        None
-    } else {
-        Some(next_account_info(iter)?)
-    };
-
-    let mut ix_data = Vec::with_capacity(21);
-    ix_data.push(12u8);
-    ix_data.push(kind);
-    ix_data.push(domain);
-    ix_data.extend_from_slice(&lockup_slots.to_le_bytes());
-    ix_data.extend_from_slice(&withdraw_delay_slots.to_le_bytes());
-    ix_data.extend_from_slice(&dao_fee_bps.to_le_bytes());
-    let mut ix_accounts = vec![
-        AccountMeta::new(*payer.key, true),
-        AccountMeta::new_readonly(*authority.key, true),
-        AccountMeta::new_readonly(*market_slab.key, false),
-        AccountMeta::new(*risk_vault.key, false),
-        AccountMeta::new_readonly(*coin_mint.key, false),
-        AccountMeta::new_readonly(*coin_cfg.key, false),
-        AccountMeta::new_readonly(*collateral_mint.key, false),
-        AccountMeta::new(*token_vault.key, false),
-        AccountMeta::new(*engine_ledger.key, false),
-        AccountMeta::new_readonly(*token_program.key, false),
-        AccountMeta::new_readonly(*rent_sysvar.key, false),
-        AccountMeta::new_readonly(*system_program.key, false),
-        AccountMeta::new_readonly(*percolator_program.key, false),
-    ];
-    if let Some(fee_destination) = fee_destination {
-        ix_accounts.push(AccountMeta::new_readonly(*fee_destination.key, false));
-    }
-    let ix = Instruction {
-        program_id: *rewards_program.key,
-        accounts: ix_accounts,
-        data: ix_data,
-    };
-
-    let mut cpi_accounts = vec![
-        payer.clone(),
-        authority.clone(),
-        market_slab.clone(),
-        risk_vault.clone(),
-        coin_mint.clone(),
-        coin_cfg.clone(),
-        collateral_mint.clone(),
-        token_vault.clone(),
-        engine_ledger.clone(),
-        token_program.clone(),
-        rent_sysvar.clone(),
-        system_program.clone(),
-        percolator_program.clone(),
-        rewards_program.clone(),
-    ];
-    if let Some(fee_destination) = fee_destination {
-        cpi_accounts.insert(cpi_accounts.len() - 1, fee_destination.clone());
-    }
-
-    invoke_signed(&ix, &cpi_accounts, &[&signer_seeds])
 }
 
 fn process_percolator_admin<'a>(

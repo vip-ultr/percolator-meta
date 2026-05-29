@@ -1212,6 +1212,7 @@ fn process_mint_reward<'a>(
     let destination = next_account_info(iter)?;
     let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let genesis_cfg_account = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
     if amount == 0 {
@@ -1229,6 +1230,15 @@ fn process_mint_reward<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
     require_live(&coin_cfg)?;
+    // The discretionary governance mint is locked until genesis is finalized, so the
+    // winner-take-all distribution of the *fixed* reward_supply cannot be diluted
+    // while depositors are voting. Post-finalize (MetaDAO in control) it is open and
+    // uncapped — the intended tool for ongoing rewards.
+    let genesis_cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
+    if !genesis_cfg.is_finalized() {
+        msg!("mint_reward is locked until genesis is finalized");
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let destination_token = load_token_account(destination)?;
     if destination_token.mint != *coin_mint.key {
         msg!("Reward destination mint mismatch");
@@ -2874,6 +2884,20 @@ fn process_handover_genesis_squads<'a>(
         return Err(ProgramError::InvalidInstructionData);
     }
     let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
+
+    // The handover rotates config_authority to the winning DAO. Reject the dead
+    // (all-zeros) key — for which no signer exists, which would permanently brick
+    // governance over the multisig — and a no-op rotation back to the current
+    // market_admin authority (so off-chain tooling can't silently leave control
+    // with the genesis program).
+    if *new_authority.key == Pubkey::default() {
+        msg!("handover authority cannot be the null key");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *new_authority.key == *market_admin.key {
+        msg!("handover target must differ from the current market_admin authority");
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Re-derive the multisig from this program's create-key PDA.
     let (create_key, _) =

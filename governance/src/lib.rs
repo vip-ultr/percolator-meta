@@ -1014,6 +1014,7 @@ fn process_mint_reward<'a>(
     let destination = next_account_info(iter)?;
     let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let genesis_cfg = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
     let bump = verify_authority_controller(
@@ -1039,6 +1040,7 @@ fn process_mint_reward<'a>(
             AccountMeta::new(*destination.key, false),
             AccountMeta::new_readonly(*mint_authority.key, false),
             AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new_readonly(*genesis_cfg.key, false),
         ],
         data: ix_data,
     };
@@ -1053,6 +1055,7 @@ fn process_mint_reward<'a>(
             destination.clone(),
             mint_authority.clone(),
             token_program.clone(),
+            genesis_cfg.clone(),
             rewards_program.clone(),
         ],
         &[&signer_seeds],

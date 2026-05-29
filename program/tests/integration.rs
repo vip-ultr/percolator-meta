@@ -1621,6 +1621,17 @@ impl TestEnv {
         self.svm.set_account(genesis_cfg, account).unwrap();
     }
 
+    fn force_genesis_finalized_for_test(&mut self) {
+        let genesis_cfg = self.genesis_cfg_pda();
+        let mut account = self
+            .svm
+            .get_account(&genesis_cfg)
+            .expect("genesis cfg missing");
+        account.data[136] = 1; // finalized
+        account.data[137] = 1; // kicked (finalized implies kicked)
+        self.svm.set_account(genesis_cfg, account).unwrap();
+    }
+
     fn install_executable_builder_for_test(&mut self, builder_program: Pubkey) {
         let bytes = std::fs::read(governance_path()).expect("read governance BPF for builder");
         self.svm.add_program(builder_program, &bytes);
@@ -1654,6 +1665,7 @@ impl TestEnv {
                 AccountMeta::new(*destination, false),
                 AccountMeta::new_readonly(self.mint_authority_pda, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
             ],
             data: encode_governance_mint_reward(amount),
         };
@@ -1959,6 +1971,7 @@ fn test_trusted_bootstrap_ceremony_flow() {
 fn test_configurable_bootstrap_delay_blocks_live_actions_until_live() {
     let mut env = TestEnv::new();
     env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(1_000);
 
     let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
     let dao_dest = env.create_coin_ata(&env.dao_authority.pubkey(), 0);
@@ -1982,8 +1995,14 @@ fn test_configurable_bootstrap_delay_blocks_live_actions_until_live() {
     assert_eq!(live_slot, 150);
     assert_eq!(cfg_account.data[64], 1);
 
+    // Live but genesis not finalized: the governed mint is still locked.
+    assert!(
+        env.try_governance_mint_reward(&dao, 1, &dao_dest).is_err(),
+        "governed mint stays locked until genesis finalization"
+    );
+    env.force_genesis_finalized_for_test();
     env.try_governance_mint_reward(&dao, 1, &dao_dest)
-        .expect("governed reward mint should succeed after live activation");
+        .expect("governed reward mint should succeed after finalization");
     assert_eq!(env.read_token_balance(&dao_dest), 1);
 }
 
@@ -2687,7 +2706,12 @@ fn test_governance_init_authority_requires_current_mint_authority() {
 #[test]
 fn test_governance_reward_lifecycle_mint_and_transfer_authority() {
     let mut env = TestEnv::new();
-    env.init_coin_config();
+    env.init_coin_config_with_delay(1);
+    // The governed mint is the post-genesis reward tool; it unlocks at finalization.
+    env.init_genesis_bootstrap(1_000);
+    env.set_clock(110);
+    env.activate_live();
+    env.force_genesis_finalized_for_test();
 
     let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
     let dao_dest = env.create_coin_ata(&env.dao_authority.pubkey(), 0);
@@ -2723,23 +2747,35 @@ fn test_governance_reward_lifecycle_mint_and_transfer_authority() {
 }
 
 #[test]
-fn test_bootstrap_phase_blocks_governed_reward_mint_until_live() {
+fn test_governed_reward_mint_locked_until_genesis_finalized() {
     let mut env = TestEnv::new();
     env.init_coin_config_with_delay(10);
+    env.init_genesis_bootstrap(1_000);
 
     let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
     let dao_dest = env.create_coin_ata(&env.dao_authority.pubkey(), 0);
-    let result = env.try_governance_mint_reward(&dao, 1, &dao_dest);
+
+    // Blocked during the bootstrap phase (not yet live).
     assert!(
-        result.is_err(),
-        "bootstrap phase must block governed reward minting"
+        env.try_governance_mint_reward(&dao, 1, &dao_dest).is_err(),
+        "bootstrap phase blocks the governed mint"
     );
     assert_eq!(env.read_token_balance(&dao_dest), 0);
 
     env.set_clock(110);
     env.activate_live();
+    // Still blocked: the COIN is live and depositors are voting, but genesis is not
+    // finalized — the fixed reward_supply cannot be diluted mid-vote (issue #12).
+    assert!(
+        env.try_governance_mint_reward(&dao, 1, &dao_dest).is_err(),
+        "governed mint stays locked until genesis is finalized"
+    );
+    assert_eq!(env.read_token_balance(&dao_dest), 0);
+
+    // Post-finalization (MetaDAO in control) the mint is open and uncapped.
+    env.force_genesis_finalized_for_test();
     env.try_governance_mint_reward(&dao, 1, &dao_dest)
-        .expect("governed reward mint should succeed after live activation");
+        .expect("governed mint unlocks once genesis is finalized");
     assert_eq!(env.read_token_balance(&dao_dest), 1);
 }
 
@@ -3238,6 +3274,42 @@ fn test_genesis_squads_create_and_handover_through_governance() {
             },
         )
         .unwrap();
+
+    // --- issue #13: the handover must reject a dead/null target (no signer
+    //     exists for it — would permanently brick governance) and a no-op
+    //     rotation back to the current market_admin authority ---
+    for (bad, label) in [(Pubkey::default(), "null key"), (market_admin, "self")] {
+        let bad_ix = Instruction {
+            program_id: env.governance_id,
+            accounts: vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(env.governance_authority_pda, false),
+                AccountMeta::new_readonly(env.rewards_id, false),
+                AccountMeta::new_readonly(env.coin_mint, false),
+                AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+                AccountMeta::new_readonly(genesis_cfg, false),
+                AccountMeta::new_readonly(market_admin, false),
+                AccountMeta::new_readonly(squads, false),
+                AccountMeta::new(multisig, false),
+                AccountMeta::new_readonly(bad, false),
+            ],
+            data: vec![18u8],
+        };
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                bad_ix,
+            ],
+            Some(&signer.pubkey()),
+            &[&signer],
+            env.svm.latest_blockhash(),
+        );
+        assert!(
+            env.svm.send_transaction(tx).is_err(),
+            "handover must reject {label} as the new config authority"
+        );
+    }
 
     // --- governance tag 18: rotate config_authority -> winning DAO ---
     let winning_dao = Pubkey::new_unique();

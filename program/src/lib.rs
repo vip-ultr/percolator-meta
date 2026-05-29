@@ -2883,6 +2883,19 @@ fn process_handover_genesis_squads<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
 
+    // The incoming authority must be a usable signer key. `Pubkey::default()`
+    // (all zeros, no private key) would permanently lock the multisig, and a
+    // no-op rotation back to the program's own market_admin PDA hides operator
+    // error from off-chain tooling.
+    if *new_authority.key == Pubkey::default() {
+        msg!("new config authority cannot be Pubkey::default()");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *new_authority.key == *market_admin.key {
+        msg!("handover target must differ from the current market_admin PDA");
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     // Rotate config_authority -> winning DAO. Only the current config_authority
     // (market_admin PDA) signs; the incoming authority is just an argument.
     let mut ix_data = alloc::vec::Vec::with_capacity(41);

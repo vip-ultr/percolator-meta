@@ -4075,3 +4075,169 @@ fn test_genesis_bootstrap_exit_rejects_overpull() {
     );
     assert_eq!(env.percolator_insurance_balance(&slab), 2, "market untouched on rejected over-pull");
 }
+
+// ============================================================================
+// Regression: handover validates the incoming config_authority
+//
+// `handover_genesis_squads` must reject `Pubkey::default()` (which would
+// permanently lock the multisig — no signer exists for the all-zeros key)
+// and reject a no-op rotation back to the current `market_admin` PDA. Both
+// cases would otherwise be silently accepted because the new authority is
+// forwarded straight into the Squads CPI.
+// ============================================================================
+#[test]
+fn test_handover_rejects_null_or_self_new_authority() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+    let (program_config, treasury) = install_squads(&mut env);
+    let squads = squads_program_id();
+    let (create_key, multisig) = squads_multisig_for(&env);
+    let market_admin = env.market_admin_pda();
+    let dao_signer = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 10);
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    let (percolator_vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+
+    let create_squads = Instruction {
+        program_id: env.governance_id,
+        accounts: vec![
+            AccountMeta::new(dao_signer.pubkey(), true),
+            AccountMeta::new_readonly(env.governance_authority_pda, false),
+            AccountMeta::new_readonly(env.rewards_id, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(create_key, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new_readonly(program_config, false),
+            AccountMeta::new(treasury, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![17u8],
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            create_squads,
+        ],
+        Some(&dao_signer.pubkey()),
+        &[&dao_signer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("create squads multisig");
+
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    env.set_clock(150);
+    env.activate_live();
+
+    let alice_coin = env.create_coin_ata(&alice.pubkey(), 0);
+    env.init_genesis_distribution(1, &alice_coin);
+    env.vote_genesis_distribution(&alice, 1);
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+    env.trigger_genesis_distribution(&cranker, 1, &alice_coin);
+
+    let recover = |env: &mut TestEnv, kind: u8, domain: u8, amount: u64| {
+        let ix = Instruction {
+            program_id: env.governance_id,
+            accounts: vec![
+                AccountMeta::new(env.dao_authority.pubkey(), true),
+                AccountMeta::new(env.governance_authority_pda, false),
+                AccountMeta::new_readonly(env.rewards_id, false),
+                AccountMeta::new_readonly(env.coin_mint, false),
+                AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+                AccountMeta::new_readonly(env.genesis_cfg_pda(), false),
+                AccountMeta::new_readonly(env.market_admin_pda(), false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(env.genesis_vault_pda(), false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(percolator_vault_pda, false),
+                AccountMeta::new_readonly(env.percolator_id, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_governance_recover_genesis_market(kind, domain, amount),
+        };
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                ix,
+            ],
+            Some(&env.dao_authority.pubkey()),
+            &[&env.dao_authority],
+            env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).expect("recover genesis market");
+    };
+    recover(&mut env, 0, 0, 5);
+    recover(&mut env, 1, 0, 5);
+    env.finalize_genesis();
+
+    // Precompute every key so the per-attempt builder closure captures only
+    // Pubkeys (Copy) and does not borrow `env`.
+    let governance_authority_pda = env.governance_authority_pda;
+    let rewards_id = env.rewards_id;
+    let governance_id = env.governance_id;
+    let coin_mint = env.coin_mint;
+    let coin_cfg = env.coin_cfg_pda();
+    let genesis_cfg = env.genesis_cfg_pda();
+
+    let handover_with = |new_authority: Pubkey| Instruction {
+        program_id: governance_id,
+        accounts: vec![
+            AccountMeta::new(dao_signer.pubkey(), true),
+            AccountMeta::new_readonly(governance_authority_pda, false),
+            AccountMeta::new_readonly(rewards_id, false),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new_readonly(coin_cfg, false),
+            AccountMeta::new_readonly(genesis_cfg, false),
+            AccountMeta::new_readonly(market_admin, false),
+            AccountMeta::new_readonly(squads, false),
+            AccountMeta::new(multisig, false),
+            AccountMeta::new_readonly(new_authority, false),
+        ],
+        data: vec![18u8],
+    };
+    let send = |env: &mut TestEnv, ix: Instruction| -> Result<(), String> {
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                ix,
+            ],
+            Some(&dao_signer.pubkey()),
+            &[&dao_signer],
+            env.svm.latest_blockhash(),
+        );
+        env.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    };
+
+    // (1) Pubkey::default() is rejected.
+    assert!(
+        send(&mut env, handover_with(Pubkey::default())).is_err(),
+        "handover must reject Pubkey::default() — it would permanently lock the multisig",
+    );
+
+    // (2) No-op rotation back to the current market_admin PDA is rejected.
+    assert!(
+        send(&mut env, handover_with(market_admin)).is_err(),
+        "handover must reject a self-rotation back to market_admin",
+    );
+
+    // (3) A real DAO key still succeeds.
+    let winning_dao = Pubkey::new_unique();
+    send(&mut env, handover_with(winning_dao))
+        .expect("handover to a real DAO key still succeeds");
+    let ms = env.svm.get_account(&multisig).unwrap();
+    assert_eq!(multisig_config_authority(&ms.data), winning_dao);
+}

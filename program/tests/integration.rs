@@ -1479,6 +1479,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.coin_cfg_pda(), false),
                 AccountMeta::new_readonly(self.market_admin_pda(), false),
                 AccountMeta::new_readonly(self.percolator_id, false),
+                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
             ],
             data,
         };
@@ -3257,8 +3258,8 @@ fn test_genesis_squads_create_and_handover_through_governance() {
 
     // --- craft a finalized GenesisConfig so handover is permitted ---
     let genesis_cfg = env.genesis_cfg_pda();
-    let mut gdata = vec![0u8; 160]; // GenesisConfig size
-    gdata[0..8].copy_from_slice(b"GENCFG01");
+    let mut gdata = vec![0u8; 192]; // GenesisConfig size
+    gdata[0..8].copy_from_slice(b"GENCFG02");
     gdata[8..40].copy_from_slice(env.coin_mint.as_ref()); // coin_mint
     gdata[136] = 1; // finalized
     gdata[137] = 1; // kicked
@@ -4146,4 +4147,157 @@ fn test_genesis_bootstrap_exit_rejects_overpull() {
         "cannot recover more than the remaining principal"
     );
     assert_eq!(env.percolator_insurance_balance(&slab), 2, "market untouched on rejected over-pull");
+}
+
+// ============================================================================
+// Tests: percolator_admin proxy locks invariant-breaking tags on the genesis
+// market until finalization (issues #16 and #19)
+//
+// The kickstart wires `insurance_withdraw_*` policy, a backing position, and a
+// live `market_slab` whose mode = 0 is what makes the per-depositor middle-
+// phase exit (`process_genesis_withdraw` at lib.rs:1971+) work. Three
+// whitelisted tags can destroy those invariants if applied to the genesis
+// market while genesis is not yet finalized:
+//   * UPDATE_INSURANCE_POLICY(33) — wipes `insurance_withdraw_deposit_remaining`
+//     on `deposits_only=0` or sets a giant cooldown
+//   * RESOLVE_MARKET(19) — flips mode 0 -> 1, blocking WITHDRAW_INSURANCE_LIMITED
+//   * CLOSE_SLAB(13) — destroys the slab; load_percolator_market_config rejects
+//
+// The proxy now records the kickstart's slab in `GenesisConfig.genesis_market_slab`
+// and rejects those three tags on that slab while `!is_finalized()`. Post-
+// finalization (MetaDAO in control) the controller has full discretion — the
+// intended hand-off semantics.
+// ============================================================================
+
+fn build_perc_admin_with_tail(
+    env: &TestEnv,
+    signer: &Pubkey,
+    inner: Vec<u8>,
+    tail: Vec<AccountMeta>,
+) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(*signer, true),
+        AccountMeta::new(env.governance_authority_pda, false),
+        AccountMeta::new_readonly(env.rewards_id, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.coin_cfg_pda(), false),
+        AccountMeta::new(env.market_admin_pda(), false),
+        AccountMeta::new_readonly(env.percolator_id, false),
+        AccountMeta::new_readonly(env.genesis_cfg_pda(), false),
+    ];
+    accounts.extend(tail);
+    let mut data = vec![9u8];
+    data.extend_from_slice(&inner);
+    Instruction {
+        program_id: env.governance_id,
+        accounts,
+        data,
+    }
+}
+
+fn encode_perc_update_insurance_policy(
+    max_bps: u16,
+    deposits_only: u8,
+    cooldown_slots: u64,
+) -> Vec<u8> {
+    let mut d = vec![33u8];
+    d.extend_from_slice(&max_bps.to_le_bytes());
+    d.push(deposits_only);
+    d.extend_from_slice(&cooldown_slots.to_le_bytes());
+    d
+}
+
+#[test]
+fn test_percolator_admin_locks_invariant_breaking_tags_on_genesis_pre_finalize() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.genesis_deposit(&alice, 10);
+
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    env.set_clock(150);
+    env.activate_live();
+
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    let (percolator_vault_pda, _) =
+        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
+
+    let send = |env: &mut TestEnv, signer: &Keypair, ix: Instruction| -> Result<(), String> {
+        env.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                ix,
+            ],
+            Some(&signer.pubkey()),
+            &[signer],
+            env.svm.latest_blockhash(),
+        );
+        env.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    };
+
+    // (1) UPDATE_INSURANCE_POLICY on the genesis slab — rejected.
+    let policy_ix = build_perc_admin_with_tail(
+        &env,
+        &dao.pubkey(),
+        encode_perc_update_insurance_policy(9999, 0, 1),
+        vec![AccountMeta::new(slab, false)],
+    );
+    assert!(
+        send(&mut env, &dao, policy_ix).is_err(),
+        "UPDATE_INSURANCE_POLICY on the genesis slab must be rejected pre-finalize (issue #16)"
+    );
+
+    // (2) RESOLVE_MARKET on the genesis slab — rejected.
+    let resolve_ix = build_perc_admin_with_tail(
+        &env,
+        &dao.pubkey(),
+        vec![19u8],
+        vec![AccountMeta::new(slab, false)],
+    );
+    assert!(
+        send(&mut env, &dao, resolve_ix).is_err(),
+        "RESOLVE_MARKET on the genesis slab must be rejected pre-finalize (issue #19)"
+    );
+
+    // (3) CLOSE_SLAB on the genesis slab — rejected.
+    let close_ix = build_perc_admin_with_tail(
+        &env,
+        &dao.pubkey(),
+        vec![13u8],
+        vec![
+            AccountMeta::new(slab, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(percolator_vault_pda, false),
+            AccountMeta::new(env.genesis_vault_pda(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+    );
+    assert!(
+        send(&mut env, &dao, close_ix).is_err(),
+        "CLOSE_SLAB on the genesis slab must be rejected pre-finalize (issue #19, variant B)"
+    );
+
+    // The market is untouched — all three rejections happen at the meta-level
+    // gate before any CPI into Percolator runs.
+    assert_eq!(env.percolator_insurance_balance(&slab), 5);
+
+    // Post-finalization the gate releases — the MetaDAO inherits full
+    // discretion over the (now-handed-over) market.
+    env.force_genesis_finalized_for_test();
+    let policy_ix = build_perc_admin_with_tail(
+        &env,
+        &dao.pubkey(),
+        encode_perc_update_insurance_policy(9999, 0, 1),
+        vec![AccountMeta::new(slab, false)],
+    );
+    send(&mut env, &dao, policy_ix)
+        .expect("UPDATE_INSURANCE_POLICY unlocks post-finalization");
 }

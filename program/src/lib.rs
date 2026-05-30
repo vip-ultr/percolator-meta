@@ -186,7 +186,7 @@ const COIN_CFG_SIZE: usize = 8 + 32 + 8 + 8 + 8 + 1 + 7;
 /// GenesisConfig: base-token bootstrap deposits, fixed supply, and the running
 /// global vote tallies (total voted principal for quorum, total cast log-weight
 /// for the 50%-of-weight winner test).
-const GENESIS_CFG_SIZE: usize = 160;
+const GENESIS_CFG_SIZE: usize = 192;
 /// GenesisPosition: per-user base-unit deposit plus this voter's single backed
 /// proposal and the weight/principal it currently contributes.
 const GENESIS_POSITION_SIZE: usize = 112;
@@ -197,7 +197,7 @@ const BUILDER_APPROVAL_SIZE: usize = 152;
 
 // Discriminators
 const COIN_CFG_DISC: [u8; 8] = *b"CCFGV002";
-const GENESIS_CFG_DISC: [u8; 8] = *b"GENCFG01";
+const GENESIS_CFG_DISC: [u8; 8] = *b"GENCFG02";
 const GENESIS_POSITION_DISC: [u8; 8] = *b"GENPOS01";
 const GENESIS_DISTRIBUTION_DISC: [u8; 8] = *b"GENDIST1";
 const BUILDER_APPROVAL_DISC: [u8; 8] = *b"BLDAPP01";
@@ -416,6 +416,13 @@ struct GenesisConfig {
     /// Sum of the `floor(log2(hold)) * principal` weight of every live ballot.
     /// A proposal wins when its support exceeds half of this.
     total_cast_weight: u64,
+    /// The Percolator slab kicked off with the pooled principal. Set on the
+    /// first successful `kickstart_genesis_market`; used by the
+    /// `percolator_admin` proxy to recognise the one market whose recovery
+    /// invariants are load-bearing for pre-finalize depositor exits and to
+    /// reject controller-discretion tags that would break them.
+    /// `Pubkey::default()` until kickstart.
+    genesis_market_slab: Pubkey,
 }
 
 impl GenesisConfig {
@@ -440,6 +447,7 @@ impl GenesisConfig {
             kicked,
             total_voted_principal: u64::from_le_bytes(data[144..152].try_into().unwrap()),
             total_cast_weight: u64::from_le_bytes(data[152..160].try_into().unwrap()),
+            genesis_market_slab: Pubkey::new_from_array(data[160..192].try_into().unwrap()),
         })
     }
 
@@ -457,6 +465,7 @@ impl GenesisConfig {
         data[138..144].fill(0);
         data[144..152].copy_from_slice(&self.total_voted_principal.to_le_bytes());
         data[152..160].copy_from_slice(&self.total_cast_weight.to_le_bytes());
+        data[160..192].copy_from_slice(self.genesis_market_slab.as_ref());
     }
 
     fn is_finalized(&self) -> bool {
@@ -1415,9 +1424,32 @@ fn process_init_percolator_market<'a>(
 //   [3] coin_config PDA
 //   [4] market_admin PDA (first Percolator account; signed via invoke_signed)
 //   [5] percolator_program
-//   [6..] remaining Percolator accounts after the admin/authority account
+//   [6] genesis_config PDA
+//   [7..] remaining Percolator accounts after the admin/authority account
 //
 // Data: raw allowed Percolator admin/lifecycle instruction data.
+
+/// Tags that — applied to the genesis market while genesis is not yet finalized
+/// — destroy invariants the kickstart established for per-depositor recovery
+/// (`process_genesis_withdraw` middle phase). They remain legitimate admin
+/// operations on post-genesis markets and on the genesis market post-handover,
+/// so the proxy still allows them; the gate is per-(slab, finalized) below.
+fn percolator_admin_tag_genesis_invariant_breaking(tag: u8) -> bool {
+    matches!(
+        tag,
+        // Closing the slab destroys the only market_slab the meta-side middle
+        // phase exit can talk to.
+        PERC_IX_CLOSE_SLAB
+        // Flips mode 0 -> 1; WITHDRAW_INSURANCE_LIMITED then rejects, taking
+        // the per-depositor insurance recovery path with it.
+        | PERC_IX_RESOLVE_MARKET
+        // Either flips deposits_only=0 (wiping the depositor-recoverable
+        // counter) or sets a cooldown big enough to lock subsequent
+        // withdrawals — both deny the documented "withdraw any time"
+        // guarantee.
+        | PERC_IX_UPDATE_INSURANCE_POLICY
+    )
+}
 
 fn process_percolator_admin<'a>(
     program_id: &Pubkey,
@@ -1440,6 +1472,7 @@ fn process_percolator_admin<'a>(
     let coin_cfg_account = next_account_info(iter)?;
     let market_admin = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let genesis_cfg_account = next_account_info(iter)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1453,8 +1486,28 @@ fn process_percolator_admin<'a>(
     }
     require_live(&coin_cfg)?;
     let admin_bump = verify_market_admin_pda(market_admin, coin_mint.key, program_id)?;
+    let genesis_cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
 
     let tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+
+    // Per-tag guard: the kickstart established invariants that the per-depositor
+    // middle-phase exit depends on. While the genesis is not finalized, the
+    // controller cannot use the proxy to break them on the kicked genesis
+    // market. After finalization the MetaDAO inherits full discretion — same
+    // gate shape as mint_reward (issue #12) and transfer_mint_authority
+    // (issue #17). The first tail account is the Percolator handler's
+    // `market_ai`, so we identify "targeting the genesis market" by comparing
+    // it against the slab recorded at kickstart.
+    if percolator_admin_tag_genesis_invariant_breaking(tag) && !genesis_cfg.is_finalized() {
+        let target_slab = tail
+            .first()
+            .ok_or(ProgramError::NotEnoughAccountKeys)?
+            .key;
+        if *target_slab == genesis_cfg.genesis_market_slab {
+            msg!("percolator_admin tag is locked on the genesis market until finalization");
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    }
     let mut metas = alloc::vec::Vec::with_capacity(1 + tail.len());
     metas.push(account_meta_from_info(market_admin, true));
     for account in tail.iter() {
@@ -1617,6 +1670,7 @@ fn process_init_genesis_bootstrap<'a>(
         kicked: 0,
         total_voted_principal: 0,
         total_cast_weight: 0,
+        genesis_market_slab: Pubkey::default(),
     };
     let mut cfg_data = genesis_cfg.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
@@ -2719,6 +2773,7 @@ fn process_kickstart_genesis_market<'a>(
         )?;
     }
     cfg.kicked = 1;
+    cfg.genesis_market_slab = *market_slab.key;
     let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
     Ok(())
@@ -3191,6 +3246,7 @@ mod tests {
             kicked: 1,
             total_voted_principal: 64,
             total_cast_weight: 320,
+            genesis_market_slab: Pubkey::new_unique(),
         };
 
         let mut bytes = [0u8; GENESIS_CFG_SIZE];
@@ -3208,6 +3264,7 @@ mod tests {
         assert!(decoded.is_kicked());
         assert_eq!(decoded.total_voted_principal, 64);
         assert_eq!(decoded.total_cast_weight, 320);
+        assert_eq!(decoded.genesis_market_slab, cfg.genesis_market_slab);
         assert_eq!(decoded.outstanding_principal(), 100);
     }
 

@@ -1700,6 +1700,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.mint_authority_pda, false),
                 AccountMeta::new_readonly(*new_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
             ],
             data: encode_governance_transfer_mint_authority(),
         };
@@ -2777,6 +2778,50 @@ fn test_governed_reward_mint_locked_until_genesis_finalized() {
     env.try_governance_mint_reward(&dao, 1, &dao_dest)
         .expect("governed mint unlocks once genesis is finalized");
     assert_eq!(env.read_token_balance(&dao_dest), 1);
+}
+
+#[test]
+fn test_transfer_mint_authority_locked_until_genesis_finalized() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(10);
+    env.init_genesis_bootstrap(1_000);
+
+    let dao = Keypair::from_bytes(&env.dao_authority.to_bytes()).unwrap();
+    let foreign = Keypair::new();
+
+    // Blocked during the bootstrap phase (not yet live).
+    assert!(
+        env.try_transfer_mint_authority(&dao, &foreign.pubkey()).is_err(),
+        "bootstrap phase blocks the mint-authority rotation"
+    );
+
+    env.set_clock(110);
+    env.activate_live();
+    // Still blocked: the COIN is live and depositors are voting, but genesis is
+    // not finalized — rotating the mint authority away from the rewards PDA
+    // would let the controller mint COIN directly via spl_token::mint_to and
+    // bypass the winner-take-all `minted_supply == 0` gate (issue #17).
+    assert!(
+        env.try_transfer_mint_authority(&dao, &foreign.pubkey()).is_err(),
+        "mint-authority rotation stays locked until genesis is finalized"
+    );
+    let mint = env.read_mint(&env.coin_mint);
+    assert_eq!(
+        mint.mint_authority,
+        solana_sdk::program_option::COption::Some(env.mint_authority_pda),
+        "mint authority still points at the rewards PDA"
+    );
+
+    // Post-finalization (MetaDAO in control) the rotation is open — the
+    // intended hand-off path to the winning DAO.
+    env.force_genesis_finalized_for_test();
+    env.try_transfer_mint_authority(&dao, &foreign.pubkey())
+        .expect("rotation unlocks once genesis is finalized");
+    let mint = env.read_mint(&env.coin_mint);
+    assert_eq!(
+        mint.mint_authority,
+        solana_sdk::program_option::COption::Some(foreign.pubkey())
+    );
 }
 
 // ============================================================================

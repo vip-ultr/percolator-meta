@@ -1075,6 +1075,7 @@ fn process_transfer_mint_authority<'a>(
     let mint_authority = next_account_info(iter)?;
     let new_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let genesis_cfg = next_account_info(iter)?;
 
     let bump = verify_authority_controller(
         program_id,
@@ -1096,6 +1097,7 @@ fn process_transfer_mint_authority<'a>(
             AccountMeta::new_readonly(*mint_authority.key, false),
             AccountMeta::new_readonly(*new_authority.key, false),
             AccountMeta::new_readonly(*token_program.key, false),
+            AccountMeta::new_readonly(*genesis_cfg.key, false),
         ],
         data: vec![10u8],
     };
@@ -1110,6 +1112,7 @@ fn process_transfer_mint_authority<'a>(
             mint_authority.clone(),
             new_authority.clone(),
             token_program.clone(),
+            genesis_cfg.clone(),
             rewards_program.clone(),
         ],
         &[&signer_seeds],

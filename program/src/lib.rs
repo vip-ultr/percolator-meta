@@ -1274,6 +1274,7 @@ fn process_transfer_mint_authority<'a>(
     let mint_authority = next_account_info(iter)?;
     let new_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let genesis_cfg_account = next_account_info(iter)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1287,6 +1288,18 @@ fn process_transfer_mint_authority<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
     require_live(&coin_cfg)?;
+    // Rotating the COIN mint authority away from the rewards PDA is the supply-cap
+    // side door: the controller could rotate to a key they own, mint COIN directly
+    // (the trigger's minted_supply gate is rewards-program state, untouched by direct
+    // spl_token::mint_to), then rotate back so the winner-take-all trigger still
+    // succeeds. Same end state as issue #12, different path — lock the rotation
+    // until genesis is finalized. Post-finalize (MetaDAO in control) the authority
+    // is freely rotatable as the intended hand-off path.
+    let genesis_cfg = verify_genesis_config_pda(genesis_cfg_account, coin_mint.key, program_id)?;
+    if !genesis_cfg.is_finalized() {
+        msg!("transfer_mint_authority is locked until genesis is finalized");
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
     let ma_seeds = mint_authority_seeds(coin_mint.key);
     let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
